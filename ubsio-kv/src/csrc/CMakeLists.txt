@@ -13,6 +13,7 @@ target_include_directories(ubsio_kvc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${PROJECT_SOURCE_DIR}/include
     ${UBSIO_BOOSTIO_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/../ubsio-boostio/src/common
 )
 
 target_link_libraries(ubsio_kvc

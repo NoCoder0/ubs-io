@@ -21,6 +21,9 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <cstdlib>
+#include <cstring>
 #include "bio_tracepoint_helper.h"
 #include "bio_client_log.h"
 #include "bio_trace.h"
@@ -304,11 +307,12 @@ BResult MirrorClient::DestroyFlow(uint16_t ptId, uint64_t flowId)
 
 BResult MirrorClient::LoadAffinityFlow()
 {
-    std::vector<uint16_t> ptVec = ListLocalAffinityPt();
+    std::vector<uint16_t> ptVec = mRemoteDramMode ? mRemotePtIds : ListLocalAffinityPt();
     for (uint16_t &ptId : ptVec) {
         BResult ret = CreateFlow(ptId);
         if (UNLIKELY(ret != BIO_OK)) {
             CLIENT_LOG_ERROR("Create affinity flow instance failed, ret:" << ret << ", ptId:" << ptId << ".");
+            if (mRemoteDramMode) return ret;
         } else {
             CLIENT_LOG_INFO("Load affinity flow success, ptId:" << ptId << ".");
         }
@@ -663,6 +667,10 @@ void MirrorClient::Exit()
         mBatchExistExecutor = nullptr;
     }
     FreeIoStrategy();
+    mRemoteDramMode = false;
+    mRemoteIps.clear();
+    mRemotePtMasters.clear();
+    mRemotePtIds.clear();
 }
 
 std::vector<uint16_t> MirrorClient::ListLocalAffinityPt()
@@ -677,6 +685,86 @@ std::vector<uint16_t> MirrorClient::ListLocalAffinityPt()
     }
     mLock.UnLock();
     return ans;
+}
+
+BResult MirrorClient::InitializeRemotePlacement()
+{
+    mRemoteDramMode = false;
+    mRemoteIps.clear();
+    mRemotePtMasters.clear();
+    mRemotePtIds.clear();
+    const char *mode = std::getenv("UBSIO_KVC_MODE");
+    if (mode == nullptr || std::strcmp(mode, "standalone") == 0) return BIO_OK;
+    if (std::strcmp(mode, "remote_dram_tcp") != 0 || mMode != SEPARATES || mNetProtocol != 1) {
+        CLIENT_LOG_ERROR("Remote DRAM requires SEPARATES and the configured TCP transport, protocol:" << mNetProtocol);
+        return BIO_INVALID_PARAM;
+    }
+    const char *ipList = std::getenv("UBSIO_KVC_REMOTE_IPS");
+    if (ipList == nullptr) {
+        CLIENT_LOG_ERROR("Remote DRAM requires UBSIO_KVC_REMOTE_IPS with two IPv4 addresses.");
+        return BIO_INVALID_PARAM;
+    }
+    const std::string configured(ipList);
+    const size_t separator = configured.find(',');
+    if (separator == std::string::npos || configured.find(',', separator + 1) != std::string::npos) {
+        CLIENT_LOG_ERROR("Remote DRAM requires exactly two comma-separated IPv4 addresses.");
+        return BIO_INVALID_PARAM;
+    }
+    for (const auto &ip : {configured.substr(0, separator), configured.substr(separator + 1)}) {
+        in_addr address{};
+        if (inet_pton(AF_INET, ip.c_str(), &address) != 1 || !mRemoteIps.insert(ip).second) {
+            CLIENT_LOG_ERROR("Invalid or duplicate remote DRAM IP:" << ip);
+            return BIO_INVALID_PARAM;
+        }
+    }
+    if (mRemoteIps.size() != 2) {
+        CLIENT_LOG_ERROR("Remote DRAM requires exactly two distinct TCP hosts, count:" << mRemoteIps.size());
+        return BIO_INVALID_PARAM;
+    }
+    std::map<uint16_t, std::string> remoteNodes;
+    ReadLocker<ReadWriteLock> viewGuard(&mLock);
+    for (const auto &node : mNodeView) {
+        if (mRemoteIps.count(node.second.ip) == 0) continue;
+        if (node.second.id.VNodeId() == mLocalNid.VNodeId() || node.second.status != CM_NODE_NORMAL) {
+            CLIENT_LOG_ERROR("Remote DRAM host is local or unhealthy, ip:" << node.second.ip);
+            return BIO_CHECK_PT_FAIL;
+        }
+        remoteNodes.emplace(node.second.id.VNodeId(), node.second.ip);
+    }
+    if (remoteNodes.size() != 2) {
+        CLIENT_LOG_ERROR("Both configured remote DRAM hosts must appear in the node view, found:" << remoteNodes.size());
+        return BIO_CHECK_PT_FAIL;
+    }
+    std::set<uint16_t> masters;
+    for (const auto &entry : mPtView) {
+        const auto &pt = entry.second;
+        if (remoteNodes.count(pt.masterNodeId) == 0 || pt.state != CM_PT_NORMAL || pt.copys.size() != 1 ||
+            pt.copys[0].nodeId != pt.masterNodeId || pt.copys[0].state != CM_COPY_RUNNING) continue;
+        mRemotePtIds.push_back(entry.first);
+        mRemotePtMasters.emplace(entry.first, pt.masterNodeId);
+        masters.insert(pt.masterNodeId);
+    }
+    if (masters.size() != 2) {
+        CLIENT_LOG_ERROR("No healthy single-copy partitions on both configured remote hosts.");
+        return BIO_CHECK_PT_FAIL;
+    }
+    mRemoteDramMode = true;
+    CLIENT_LOG_INFO("Frozen remote DRAM TCP partition count:" << mRemotePtIds.size());
+    return BIO_OK;
+}
+
+bool MirrorClient::RemotePtValid(uint16_t ptId, const CmPtInfo &ptEntry) const
+{
+    auto frozen = mRemotePtMasters.find(ptId);
+    if (frozen == mRemotePtMasters.end() || frozen->second != ptEntry.masterNodeId ||
+        ptEntry.state != CM_PT_NORMAL || ptEntry.copys.size() != 1 ||
+        ptEntry.copys[0].nodeId != ptEntry.masterNodeId || ptEntry.copys[0].state != CM_COPY_RUNNING) return false;
+    for (const auto &node : mNodeView) {
+        if (node.second.id.VNodeId() == ptEntry.masterNodeId) {
+            return node.second.status == CM_NODE_NORMAL && mRemoteIps.count(node.second.ip) != 0;
+        }
+    }
+    return false;
 }
 
 uint16_t MirrorClient::SelectingPt(uint64_t objectId, AffinityStrategy affinity)
@@ -707,7 +795,11 @@ uint16_t MirrorClient::SelectingPtImpl(uint64_t objectId, AffinityStrategy affin
 {
     size_t v = std::hash<std::uint64_t>{}(objectId);
     uint16_t ptId = UINT16_MAX;
-    if (LIKELY(affinity == LOCAL_AFFINITY)) {
+    if (mRemoteDramMode && affinity != GLOBAL_BALANCE) {
+        CLIENT_LOG_ERROR("Remote DRAM cache used with non-global affinity, objectId:" << objectId);
+    } else if (mRemoteDramMode && affinity == GLOBAL_BALANCE) {
+        if (!mRemotePtIds.empty()) ptId = mRemotePtIds[v % mRemotePtIds.size()];
+    } else if (LIKELY(affinity == LOCAL_AFFINITY)) {
         std::vector<uint16_t> ptVec = ListLocalAffinityPt();
         if (!ptVec.empty()) {
             ptId = ptVec[v % ptVec.size()];
@@ -754,6 +846,11 @@ BResult MirrorClient::GetPtEntry(uint16_t ptId, CmPtInfo &ptEntry)
         mLock.UnLock();
         return BIO_CHECK_PT_FAIL;
     }
+    if (mRemoteDramMode && !RemotePtValid(ptId, iter->second)) {
+        CLIENT_LOG_ERROR("Remote DRAM partition changed or is outside frozen placement, ptId:" << ptId << ".");
+        mLock.UnLock();
+        return BIO_CHECK_PT_FAIL;
+    }
 
     ptEntry = iter->second;
     mLock.UnLock();
@@ -789,6 +886,8 @@ BResult MirrorClient::Initialize(UpdateView updateView, uint32_t scene, uint32_t
         CLIENT_LOG_ERROR("Sdk load origin view failed, ret:" << ret << ".");
         return ret;
     }
+    ret = InitializeRemotePlacement();
+    if (ret != BIO_OK) return ret;
 
     // 初始化client端的QOS控制
     ret = InitializeBioQos();
@@ -2371,6 +2470,11 @@ BResult MirrorClient::PrepareFromServer(CmPtInfo &ptEntry, MirrorPut &param, Put
 
 BResult MirrorClient::PrepareFromClient(CmPtInfo &ptEntry, MirrorPut &param, PutRequest *&req)
 {
+    if (mMode != STANDALONE && UNLIKELY(param.length == 0 || param.length > mDataMsgMemBlockSize)) {
+        CLIENT_LOG_ERROR("Put exceeds data message block, length:" << param.length <<
+                         ", blockSize:" << mDataMsgMemBlockSize);
+        return BIO_INVALID_PARAM;
+    }
     uintptr_t address = 0;
     bool isAlloc = false;
     if (mMode != STANDALONE) {
@@ -2469,6 +2573,25 @@ void MirrorClient::InitAsyncPutCbCtx(AsyncPutCbCtx &cbCtx, uint32_t quota)
 
 BResult MirrorClient::SendPutRequestImpl(CmPtInfo &ptEntry, MirrorPut &param, PutRequest *req)
 {
+    if (mRemoteDramMode) {
+        PutResponse response{};
+        BResult result = net::BioClientNet::Instance()->SendSyncBuff<PutRequest, PutResponse>(
+            static_cast<BioNodeId>(ptEntry.masterNodeId),
+            BIO_OP_SDK_PUT, req, sizeof(PutRequest) + req->sliceLen, response);
+        if (req->isAlloc && result != BIO_NET_RETRY) {
+            mDataMsgMemPool->ReleaseOne(req->mrAddress);
+        } else if (req->isAlloc) {
+            // A timed-out TCP call may still have a peer-side one-sided read in flight.
+            // Keep this bounded pool block reserved until the net service is closed.
+            CLIENT_LOG_ERROR("Quarantined uncertain remote put block, key:" << param.key << ", ret:" << result);
+        }
+        if (result == BIO_OK && response.ioStrategy > WRITE_UNDERFS_BACK) return BIO_INVALID_PARAM;
+        if (result == BIO_OK) {
+            mIoStrategy[ptEntry.ptId]->expired = Monotonic::TimeSec() + IO_EXTRATEGE_TIME;
+            mIoStrategy[ptEntry.ptId]->strategy = response.ioStrategy;
+        }
+        return result;
+    }
     uint32_t quota = CalcPtQuota(ptEntry);
     if (UNLIKELY(quota == 0)) {
         CLIENT_LOG_ERROR("Send put request without available copy.");
@@ -2639,6 +2762,10 @@ BResult MirrorClient::SendPutRequest(CmPtInfo &ptEntry, MirrorPut &param)
 BResult MirrorClient::SendAsyncPutRequest(CmPtInfo &ptEntry, MirrorPut &param, BioAsyncPutCallback callback,
     void* context)
 {
+    if (mRemoteDramMode) {
+        CLIENT_LOG_ERROR("Remote DRAM TCP requires synchronous put ownership, key:" << param.key);
+        return BIO_INVALID_PARAM;
+    }
     BIO_TRACE_START(SDK_TRACE_PUT_PREPARE);
     PutRequest *req = nullptr;
     BResult ret = Prepare(ptEntry, param, req);
@@ -2658,6 +2785,11 @@ BResult MirrorClient::SendAsyncPutRequest(CmPtInfo &ptEntry, MirrorPut &param, B
 
 BResult MirrorClient::GetServerRemote(GetRequest &req, uint16_t dstNid, char *value, uint64_t &realLen)
 {
+    if (UNLIKELY(req.length == 0 || req.length > mDataMsgMemBlockSize)) {
+        CLIENT_LOG_ERROR("Get exceeds data message block, length:" << req.length <<
+                         ", blockSize:" << mDataMsgMemBlockSize);
+        return BIO_INVALID_PARAM;
+    }
     uintptr_t address = 0;
     BResult ret = mDataMsgMemPool->AllocOne(address);
     if (UNLIKELY(ret != BIO_OK)) {
@@ -2703,7 +2835,11 @@ BResult MirrorClient::GetServerRemote(GetRequest &req, uint16_t dstNid, char *va
             }
         }
     }
-    mDataMsgMemPool->ReleaseOne(address);
+    if (ret != BIO_NET_RETRY) {
+        mDataMsgMemPool->ReleaseOne(address);
+    } else {
+        CLIENT_LOG_ERROR("Quarantined uncertain remote get block, key:" << req.key << ", ret:" << ret);
+    }
     return ret;
 }
 

@@ -158,12 +158,11 @@ UBSIO_API int32_t UbsioKvCacheBatchPut(const char **keys,
     auto ret = KvcBatchPutData(key_vector, bufs_vector, lengths_vector, batchResult, flags); 
     if (ret != UBSIO_KVC_OK) { 
         LOG_ERROR("batch put failed, keysCount: " << keysCount); 
-        return UBSIO_KVC_ERR; 
     } 
     for (uint32_t i = 0; i < keysCount; ++i) { 
         results[i] = batchResult[i]; 
     } 
-    return UBSIO_KVC_OK; 
+    return ret;
 }
 
 UBSIO_API int32_t UbsioKvCacheGet(const char *key, void *buf, size_t length, uint32_t flags) 
@@ -226,12 +225,11 @@ UBSIO_API int32_t UbsioKvCacheBatchDelete(const char **keys, uint32_t keysCount,
     auto ret = KvcBatchDeleteKey(key_vector, delete_results_vector, flags); 
     if (ret != UBSIO_KVC_OK) { 
         LOG_ERROR("Kvc batch delete failed"); 
-        return UBSIO_KVC_ERR; 
     } 
     for (uint32_t i = 0; i < keysCount; ++i) { 
         results[i] = delete_results_vector[i]; 
     } 
-    return UBSIO_KVC_OK; 
+    return ret;
 }
 
 UBSIO_API int32_t UbsioKvCacheGetLength(const char *key, size_t *length, uint32_t flags) 
@@ -268,7 +266,7 @@ UBSIO_API int32_t UbsioKvCacheBatchGetLength(const char **keys,
     std::vector<int> length_results_vector(keysCount, UBSIO_KVC_ERR); 
     std::vector<uint32_t> get_lengths; 
     key_vector.reserve(keysCount); 
-    get_lengths.reserve(keysCount); 
+    get_lengths.resize(keysCount);
 
 
     for (size_t i = 0; i < keysCount; i++) { 
@@ -286,13 +284,12 @@ UBSIO_API int32_t UbsioKvCacheBatchGetLength(const char **keys,
     auto ret = KvcBatchGetLengthKey(key_vector, get_lengths, length_results_vector, flags); 
     if (ret != UBSIO_KVC_OK) { 
         LOG_ERROR("Kvc batch get length failed"); 
-        return UBSIO_KVC_ERR; 
     } 
     for (uint32_t i = 0; i < keysCount; ++i) { 
         lengths[i] = static_cast<size_t>(get_lengths[i]); 
         results[i] = length_results_vector[i]; 
     } 
-    return UBSIO_KVC_OK; 
+    return ret;
 }
 
 UBSIO_API int32_t UbsioKvCacheBatchGet(const char **keys,
@@ -334,12 +331,11 @@ UBSIO_API int32_t UbsioKvCacheBatchGet(const char **keys,
     auto ret = KvcBatchGetData(keyVector, bufs, lengthsVector, batchResult, flags);
     if (UNLIKELY(ret != UBSIO_KVC_OK)) {
         LOG_ERROR("Kvc batch get failed, ret:" << ret);
-        return UBSIO_KVC_ERR;
     }
     for (uint32_t i = 0; i < keysCount; ++i) {
         results[i] = batchResult[i];
     }
-    return UBSIO_KVC_OK;
+    return ret;
 }
 
 int32_t UbsioKvCacheBatchGetDirect(const char **keys,
@@ -383,7 +379,7 @@ UBSIO_API int32_t UbsioKvCacheBatchExist(const char **keys, uint32_t keysCount, 
     auto ret = KvcBatchExistKey(keyVector, results, flags);
     if (UNLIKELY(ret != UBSIO_KVC_OK)) {
         LOG_ERROR("Kvc batch exist failed, ret:" << ret);
-        return UBSIO_KVC_ERR;
+        return ret;
     }
     return UBSIO_KVC_OK;
 }

@@ -13,13 +13,18 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 #include <memory>
+#include <condition_variable>
+#include <limits>
 #include "bio_c.h"
+#include "bio_err.h"
 #include "ubsio_kvc_log.h"
 #include "ubsio_kvc_err.h"
 #include "dl_biosdk_api.h"
 #include "kv_operation.h"
+#include "remote_dram_object.h"
 
 namespace ock {
 namespace ubsio {
@@ -27,6 +32,44 @@ namespace ubsio {
 KvOperation *KvOperation::gInstance = nullptr;
 std::mutex KvOperation::gLock;
 constexpr uint32_t BATCH_LIMIT = 1000;
+
+namespace {
+int32_t MapBioResult(CResult result)
+{
+    switch (result) {
+        case RET_CACHE_OK: return UBSIO_KVC_OK;
+        case RET_CACHE_NOT_FOUND:
+        case RET_CACHE_MISS: return UBSIO_KVC_NOT_FOUND;
+        case RET_CACHE_EPERM: return UBSIO_KVC_INVALID_PARAM;
+        case RET_CACHE_BUSY:
+        case RET_CACHE_NEED_RETRY:
+        case RET_CACHE_NOT_READY:
+        case RET_CACHE_NO_SPACE:
+        case RET_CACHE_UNAVAILABLE:
+        case RET_CACHE_EXCEED_QUOTA:
+        case RET_CACHE_PT_FAULT: return UBSIO_KVC_UNAVAILABLE;
+        default: return UBSIO_KVC_BIO_ERR;
+    }
+}
+
+int32_t MapBioBatchResult(int32_t result)
+{
+    switch (result) {
+        case bio::BIO_OK: return UBSIO_KVC_OK;
+        case bio::BIO_NOT_EXISTS: return UBSIO_KVC_NOT_FOUND;
+        case bio::BIO_CRC_ERR: return UBSIO_KVC_CORRUPT;
+        case bio::BIO_INVALID_PARAM: return UBSIO_KVC_INVALID_PARAM;
+        case bio::BIO_NOT_READY:
+        case bio::BIO_ALLOC_FAIL:
+        case bio::BIO_CHECK_PT_FAIL:
+        case bio::BIO_INNER_RETRY:
+        case bio::BIO_NET_RETRY:
+        case bio::BIO_QUOTA_NOT_ENOUGH:
+        case bio::BIO_QUOTA_TIMEOUT: return UBSIO_KVC_UNAVAILABLE;
+        default: return UBSIO_KVC_BIO_ERR;
+    }
+}
+}
 
 int32_t KvOperation::Initialize(const std::string &path)
 {
@@ -41,60 +84,73 @@ int32_t KvOperation::Initialize(const std::string &path)
 
 void KvOperation::UnInitialize(void)
 {
-    std::lock_guard<std::mutex> guard(mMutex);
-    if (!mInited) {
-        LOG_INFO("KvOperation has not been initialized");
-        return;
+    {
+        std::lock_guard<std::mutex> guard(mMutex);
+        if (!mInited) {
+            LOG_INFO("KvOperation has not been initialized");
+            return;
+        }
+        mInited = false;
     }
     ExitKvExecutor();
-    mInited = false;
 }
 
 int32_t KvOperation::KvPutData(const std::string &key, void *value, size_t len)
 {
+    if (DlBioSdkApi::RemoteMode()) return remote_dram::Put(key, value, len);
     ObjLocation location;
-    CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
+    CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+        static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
     if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
         LOG_ERROR("Calc location failed, status:" << status);
         return UBSIO_KVC_ERR;
     }
-    return DlBioSdkApi::Put(tenantId, key.c_str(), reinterpret_cast<char*>(value), (uint64_t)len, location);
+    return MapBioResult(DlBioSdkApi::Put(DlBioSdkApi::TenantId(), key.c_str(),
+        reinterpret_cast<char*>(value), len, location));
 }
 
 int32_t KvOperation::KvGetData(const std::string &key, void *value, size_t len)
 {
+    if (DlBioSdkApi::RemoteMode()) return remote_dram::Get(key, value, len);
     ObjLocation location;
-    CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
+    CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+        static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
     if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
         LOG_ERROR("CalcLocation failed with returned status " << status);
         return UBSIO_KVC_ERR;
     }
     uint64_t outLength = 0;
-    return DlBioSdkApi::Get(tenantId, key.c_str(), 0, (uint64_t)len, location, reinterpret_cast<char*>(value), &outLength);
+    int32_t result = MapBioResult(DlBioSdkApi::Get(DlBioSdkApi::TenantId(), key.c_str(), 0, len,
+        location, reinterpret_cast<char*>(value), &outLength));
+    return result == UBSIO_KVC_OK && outLength != len ? UBSIO_KVC_CORRUPT : result;
 }
 
 int32_t KvOperation::KvDeleteKey(const std::string &key)
 {
+    if (DlBioSdkApi::RemoteMode()) return remote_dram::Delete(key);
     ObjLocation location;
-    CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
+    CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+        static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
     if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
         LOG_ERROR("CalcLocation failed with returned status " << status);
         return UBSIO_KVC_ERR;
     }
-    return DlBioSdkApi::Delete(tenantId, key.c_str(), location);
+    return MapBioResult(DlBioSdkApi::Delete(DlBioSdkApi::TenantId(), key.c_str(), location));
 }
 
 bool KvOperation::KvExistKey(const std::string &key)
 {
+    if (DlBioSdkApi::RemoteMode()) return remote_dram::Exist(key) == UBSIO_KVC_OK;
     ObjLocation location;
-    CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
+    CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+        static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
     if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
         LOG_ERROR("CalcLocation failed with returned status " << status);
         return false;
     }
     ObjStat stat;
     stat.size = 0;
-    auto ret = DlBioSdkApi::Stat(tenantId, key.c_str(), location, &stat);
+    auto ret = DlBioSdkApi::Stat(DlBioSdkApi::TenantId(), key.c_str(), location, &stat);
     if ((ret != CResult::RET_CACHE_OK) || (stat.size == 0)) {
         return false;
     }
@@ -103,18 +159,20 @@ bool KvOperation::KvExistKey(const std::string &key)
 
 int32_t KvOperation::KvGetLengthKey(const std::string &key, uint32_t &length)
 {
+    if (DlBioSdkApi::RemoteMode()) return remote_dram::Length(key, length);
     ObjLocation location;
-    CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
+    CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+        static_cast<uint64_t>(std::hash<std::string>{}(key)), &location);
     if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
         LOG_ERROR("CalcLocation failed with returned status " << status);
         return UBSIO_KVC_ERR;
     }
     ObjStat stat;
     stat.size = 0;
-    auto ret = DlBioSdkApi::Stat(tenantId, key.c_str(), location, &stat);
+    auto ret = DlBioSdkApi::Stat(DlBioSdkApi::TenantId(), key.c_str(), location, &stat);
     if ((ret != CResult::RET_CACHE_OK) || (stat.size == 0)) {
         LOG_ERROR("Exist data from meta failed, ret: " << ret);
-        return UBSIO_KVC_ERR;
+        return ret == RET_CACHE_OK ? UBSIO_KVC_CORRUPT : MapBioResult(ret);
     }
     length = stat.size;
     return UBSIO_KVC_OK;
@@ -123,6 +181,15 @@ int32_t KvOperation::KvGetLengthKey(const std::string &key, uint32_t &length)
 int32_t KvOperation::BatchKvGetData(const std::vector<std::string> &key, void **bufs,
     std::vector<size_t> &lengths, std::vector<int> &results)
 {
+    if (DlBioSdkApi::RemoteMode()) {
+        if (bufs == nullptr || lengths.size() != key.size() || results.size() < key.size()) {
+            return UBSIO_KVC_INVALID_PARAM;
+        }
+        for (size_t i = 0; i < key.size(); ++i) {
+            results[i] = KvGetData(key[i], bufs[i], lengths[i]);
+        }
+        return UBSIO_KVC_OK;
+    }
     uint32_t keysCount = key.size();
     std::vector<ObjLocation> locationVec(keysCount);
     std::vector<uint64_t> realLength(keysCount);
@@ -130,7 +197,8 @@ int32_t KvOperation::BatchKvGetData(const std::vector<std::string> &key, void **
     std::vector<const char*> keys(keysCount);
     for (size_t i = 0; i < keysCount; i++) {
         ObjLocation location;
-        CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key[i])), &location);
+        CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+            static_cast<uint64_t>(std::hash<std::string>{}(key[i])), &location);
         if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
             LOG_ERROR("Calc location failed, status:" << status);
             return UBSIO_KVC_ERR;
@@ -139,18 +207,33 @@ int32_t KvOperation::BatchKvGetData(const std::vector<std::string> &key, void **
         keys[i] = key[i].c_str();
     }
 
-    return DlBioSdkApi::BatchGet(tenantId, keys.data(), keysCount, offsets.data(), lengths.data(), locationVec.data(),
-        reinterpret_cast<uintptr_t *>(bufs), realLength.data(), results.data());
+    int32_t ret = MapBioResult(DlBioSdkApi::BatchGet(DlBioSdkApi::TenantId(), keys.data(), keysCount,
+        offsets.data(), lengths.data(), locationVec.data(), reinterpret_cast<uintptr_t *>(bufs),
+        realLength.data(), results.data()));
+    for (size_t i = 0; i < keysCount; ++i) {
+        results[i] = MapBioBatchResult(results[i]);
+        if (results[i] == UBSIO_KVC_OK && realLength[i] != lengths[i]) results[i] = UBSIO_KVC_CORRUPT;
+    }
+    return ret;
 }
 
 int32_t KvOperation::BatchKvExistKey(const std::vector<std::string> &key, bool *results)
 {
+    if (DlBioSdkApi::RemoteMode()) {
+        for (size_t i = 0; i < key.size(); ++i) {
+            int32_t result = remote_dram::Exist(key[i]);
+            if (result != UBSIO_KVC_OK && result != UBSIO_KVC_NOT_FOUND) return result;
+            results[i] = result == UBSIO_KVC_OK;
+        }
+        return UBSIO_KVC_OK;
+    }
     uint32_t keysCount = key.size();
     std::vector<ObjLocation> locationVec(keysCount);
     std::vector<const char *> keys(keysCount);
     for (size_t i = 0; i < keysCount; i++) {
         ObjLocation location;
-        CResult status = DlBioSdkApi::CalcLocation(tenantId, static_cast<uint64_t>(std::hash<std::string>{}(key[i])), &location);
+        CResult status = DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(),
+            static_cast<uint64_t>(std::hash<std::string>{}(key[i])), &location);
         if (UNLIKELY(status != CResult::RET_CACHE_OK)) {
             LOG_ERROR("Calc location failed, status:" << status);
             return UBSIO_KVC_ERR;
@@ -159,7 +242,7 @@ int32_t KvOperation::BatchKvExistKey(const std::vector<std::string> &key, bool *
         keys[i] = key[i].c_str();
     }
 
-    int ret = DlBioSdkApi::BatchExist(tenantId, keys.data(), locationVec.data(), keysCount, results);
+    int ret = DlBioSdkApi::BatchExist(DlBioSdkApi::TenantId(), keys.data(), locationVec.data(), keysCount, results);
     if (ret != UBSIO_KVC_OK) {
         LOG_ERROR("BioBatchExist failed with returned status " << ret);
         return UBSIO_KVC_ERR;
@@ -167,122 +250,77 @@ int32_t KvOperation::BatchKvExistKey(const std::vector<std::string> &key, bool *
     return UBSIO_KVC_OK;
 }
 
-int32_t KvOperation::BatchKvPutData(const std::vector<std::string> &key, std::vector<void*> &value,
-    std::vector<size_t> &lengths, std::vector<int> &results)
+int32_t KvOperation::RunBatch(size_t count, std::vector<int> &results,
+                              const std::function<int32_t(size_t)> &task)
 {
-    auto totalSize = key.size();
-    for (uint32_t start = 0; start < totalSize; start += BATCH_LIMIT) {
-        sem_t sem;
-        sem_init(&sem, 0, 0);
-        uint32_t end = std::min(start + BATCH_LIMIT, (uint32_t)totalSize);
-        uint32_t batchSize = end - start;
-        auto keySize = std::make_shared<std::atomic<uint32_t>>(batchSize);
-        for (uint32_t i = start; i < end; i++) {
-            auto index = i;
-            auto keyCopy = key[i];
-            auto valueCopy = value[i];
-            auto lengthCopy = lengths[i];
-            std::function<void()> func = [this, index, keyCopy, valueCopy, lengthCopy,
-                &results, keySize, &sem, totalSize]() {
-                auto ret = KvPutData(keyCopy, valueCopy, lengthCopy);
-                if (ret != UBSIO_KVC_OK) {
-                    LOG_ERROR("Batch put data failed, ret: " << ret
-                        << " batch num: " << totalSize << " i:" << index);
+    std::lock_guard<std::mutex> executorGuard(mBatchMutex);
+    if (mKvExecutor == nullptr || results.size() < count) return UBSIO_KVC_INVALID_PARAM;
+    for (size_t start = 0; start < count; start += BATCH_LIMIT) {
+        std::mutex mutex;
+        std::condition_variable completed;
+        size_t pending = 0;
+        bool submitFailed = false;
+        const size_t end = std::min(start + BATCH_LIMIT, count);
+        for (size_t index = start; index < end; ++index) {
+            {
+                std::lock_guard<std::mutex> guard(mutex);
+                ++pending;
+            }
+            bool accepted = mKvExecutor->Execute([&, index]() {
+                try {
+                    results[index] = task(index);
+                } catch (...) {
+                    LOG_ERROR("Batch task threw, index:" << index);
+                    results[index] = UBSIO_KVC_ERR;
                 }
-                results[index] = ret;
-                if (keySize->fetch_sub(1) == 1) {
-                    sem_post(&sem);
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    --pending;
                 }
-            };
-
-            auto result = mKvExecutor->Execute(func);
-            if (!result) {
-                LOG_ERROR("Execute batch put data, batch num: " << totalSize << " i:" << i);
-                sem_destroy(&sem);
-                return UBSIO_KVC_ERR;
+                completed.notify_one();
+            });
+            if (!accepted) {
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    --pending;
+                }
+                results[index] = UBSIO_KVC_UNAVAILABLE;
+                for (size_t rest = index + 1; rest < count; ++rest) results[rest] = UBSIO_KVC_UNAVAILABLE;
+                submitFailed = true;
+                break;
             }
         }
-        sem_wait(&sem);
-        sem_destroy(&sem);
+        std::unique_lock<std::mutex> guard(mutex);
+        completed.wait(guard, [&pending]() { return pending == 0; });
+        if (submitFailed) {
+            LOG_ERROR("Batch executor rejected task after partial submission, start:" << start);
+            return UBSIO_KVC_UNAVAILABLE;
+        }
     }
     return UBSIO_KVC_OK;
 }
 
+int32_t KvOperation::BatchKvPutData(const std::vector<std::string> &key, std::vector<void*> &value,
+    std::vector<size_t> &lengths, std::vector<int> &results)
+{
+    if (key.size() != value.size() || key.size() != lengths.size()) return UBSIO_KVC_INVALID_PARAM;
+    return RunBatch(key.size(), results, [&](size_t index) {
+        return KvPutData(key[index], value[index], lengths[index]);
+    });
+}
+
 int32_t KvOperation::BatchKvDeleteKey(const std::vector<std::string> &key, std::vector<int> &results)
 {
-    auto totalSize = key.size();
-    for (uint32_t start = 0; start < totalSize; start += BATCH_LIMIT) {
-        sem_t sem;
-        sem_init(&sem, 0, 0);
-        uint32_t end = std::min(start + BATCH_LIMIT, (uint32_t)totalSize);
-        uint32_t batchSize = end - start;
-        auto keySize = std::make_shared<std::atomic<uint32_t>>(batchSize);
-        for (uint32_t i = start; i < end; i++) {
-            auto index = i;
-            auto keyCopy = key[i];
-            std::function<void()> func = [this, index, keyCopy, &results,
-                keySize, &sem, totalSize]() {
-                auto ret = KvDeleteKey(keyCopy);
-                if (ret != UBSIO_KVC_OK) {
-                    LOG_ERROR("Batch delete key failed, ret: " << ret
-                        << " batch num: " << totalSize << " i:" << index);
-                }
-                results[index] = ret;
-                if (keySize->fetch_sub(1) == 1) {
-                    sem_post(&sem);
-                }
-            };
-
-            auto result = mKvExecutor->Execute(func);
-            if (!result) {
-                LOG_ERROR("Execute batch delete key, batch num: " << totalSize << " i:" << i);
-                sem_destroy(&sem);
-                return UBSIO_KVC_ERR;
-            }
-        }
-        sem_wait(&sem);
-        sem_destroy(&sem);
-    }
-    return UBSIO_KVC_OK;
+    return RunBatch(key.size(), results, [&](size_t index) { return KvDeleteKey(key[index]); });
 }
 
 int32_t KvOperation::BatchGetLengthKey(const std::vector<std::string> &key, std::vector<uint32_t> &lengths,
                                        std::vector<int> &results)
 {
-    auto totalSize = key.size();
-    for (uint32_t start = 0; start < totalSize; start += BATCH_LIMIT) {
-        sem_t sem;
-        sem_init(&sem, 0, 0);
-        uint32_t end = std::min(start + BATCH_LIMIT, (uint32_t)totalSize);
-        uint32_t batchSize = end - start;
-        auto keySize = std::make_shared<std::atomic<uint32_t>>(batchSize);
-        for (uint32_t i = start; i < end; i++) {
-            auto index = i;
-            auto keyCopy = key[i];
-            std::function<void()> func = [this, index, keyCopy, &lengths, &results,
-                keySize, &sem, totalSize]() {
-                auto ret = KvGetLengthKey(keyCopy, lengths[index]);
-                if (ret != UBSIO_KVC_OK) {
-                    LOG_ERROR("Batch get length failed, ret: " << ret
-                        << " batch num: " << totalSize << " i:" << index);
-                }
-                results[index] = ret;
-                if (keySize->fetch_sub(1) == 1) {
-                    sem_post(&sem);
-                }
-            };
-
-            auto result = mKvExecutor->Execute(func);
-            if (!result) {
-                LOG_ERROR("Execute batch get length, batch num: " << totalSize << " i:" << i);
-                sem_destroy(&sem);
-                return UBSIO_KVC_ERR;
-            }
-        }
-        sem_wait(&sem);
-        sem_destroy(&sem);
-    }
-    return UBSIO_KVC_OK;
+    if (lengths.size() < key.size()) return UBSIO_KVC_INVALID_PARAM;
+    return RunBatch(key.size(), results, [&](size_t index) {
+        return KvGetLengthKey(key[index], lengths[index]);
+    });
 }
 }; // namespace ubsio
 } // namespace ock

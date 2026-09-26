@@ -16,6 +16,7 @@
 #include <semaphore.h>
 #include <atomic>
 #include <unordered_map>
+#include <set>
 #include "cm.h"
 #include "bio_ref.h"
 #include "bio_lock.h"
@@ -266,6 +267,8 @@ public:
     BResult RebuildPtView();
 
     BResult GetPtEntry(uint16_t ptId, ock::bio::CmPtInfo &ptEntry);
+    BResult InitializeRemotePlacement();
+    bool RemotePtValid(uint16_t ptId, const CmPtInfo &ptEntry) const;
 
     BResult PutAlignSize(const char *value, MirrorPut &param, bool &isAllocMem);
 
@@ -484,6 +487,10 @@ private:
     CmNodeId mLocalNid;
     std::map<CmNodeId, CmNodeInfo, CmNodeIdCmp> mNodeView;
     std::map<uint16_t, CmPtInfo> mPtView;
+    bool mRemoteDramMode = false;
+    std::set<std::string> mRemoteIps;
+    std::map<uint16_t, uint16_t> mRemotePtMasters;
+    std::vector<uint16_t> mRemotePtIds;
     std::map<uint16_t, IoStrategy *> mIoStrategy;
     uint64_t mCurNodeTimes;
     uint64_t mCurPtTimes;

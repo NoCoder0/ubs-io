@@ -1,0 +1,340 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ * ubs-io is licensed under the Mulan PSL v2.
+ */
+#include "remote_dram_object.h"
+
+#include <array>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <random>
+#include <unistd.h>
+#ifdef UBSIO_REMOTE_DRAM_OBJECT_MOCK
+#include "remote_dram_object_mock_api.h"
+#else
+#include "bio_c.h"
+#include "dl_biosdk_api.h"
+#include "ubsio_kvc_log.h"
+#endif
+#include "ubsio_kvc_err.h"
+
+namespace ock {
+namespace ubsio {
+namespace remote_dram {
+namespace {
+
+constexpr uint64_t MANIFEST_MAGIC = 0x314d41524443564bULL; // KVCDRAM1, little endian
+constexpr uint32_t MANIFEST_VERSION = 1;
+constexpr size_t KEY_LOCK_COUNT = 256;
+constexpr size_t MAX_KEYS_PER_SHARD = 4096; // At most 1M logical directory entries per SDK.
+std::array<std::mutex, KEY_LOCK_COUNT> keyLocks;
+std::atomic<uint64_t> generationCounter{1};
+
+struct Manifest {
+    uint64_t magic;
+    uint64_t generation;
+    uint64_t keyHash;
+    uint64_t length;
+    uint32_t version;
+    uint32_t chunkBytes;
+    uint32_t chunkCount;
+    uint32_t dataCrc;
+};
+static_assert(sizeof(Manifest) == 48, "Remote manifest ABI changed");
+// This is a volatile, process-owned cache directory, never a remotely overwritten
+// logical-key manifest. A timed-out write cannot publish itself into this directory.
+std::array<std::map<std::string, Manifest>, KEY_LOCK_COUNT> committed;
+
+std::string ManifestKey(const Manifest &manifest);
+
+uint64_t HashKey(const std::string &key)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char c : key) {
+        hash = (hash ^ c) * 1099511628211ULL;
+    }
+    return hash;
+}
+
+uint32_t Crc32(const void *data, size_t length)
+{
+    static const auto table = []() {
+        std::array<uint32_t, 256> values{};
+        for (uint32_t i = 0; i < values.size(); ++i) {
+            uint32_t crc = i;
+            for (uint32_t bit = 0; bit < 8; ++bit) {
+                crc = (crc >> 1) ^ ((crc & 1U) ? 0xedb88320U : 0U);
+            }
+            values[i] = crc;
+        }
+        return values;
+    }();
+    uint32_t crc = ~0U;
+    auto *bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < length; ++i) {
+        crc = table[(crc ^ bytes[i]) & 0xffU] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+uint64_t NewGeneration()
+{
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    uint64_t entropy = static_cast<uint64_t>(now) ^ (static_cast<uint64_t>(getpid()) << 32);
+    try {
+        std::random_device random;
+        entropy ^= (static_cast<uint64_t>(random()) << 32) | random();
+    } catch (...) {
+        LOG_ERROR("random_device failed; using clock and process ID for remote generation");
+    }
+    return entropy ^ generationCounter.fetch_add(1);
+}
+
+std::string ChunkKey(const Manifest &manifest, uint32_t index)
+{
+    char suffix[96];
+    std::snprintf(suffix, sizeof(suffix), "__kvc_tcp_v1_%016llx_%016llx_%08x",
+                  static_cast<unsigned long long>(manifest.keyHash),
+                  static_cast<unsigned long long>(manifest.generation), index);
+    return suffix;
+}
+
+int32_t MapBio(CResult result)
+{
+    switch (result) {
+        case RET_CACHE_OK: return UBSIO_KVC_OK;
+        case RET_CACHE_NOT_FOUND:
+        case RET_CACHE_MISS: return UBSIO_KVC_NOT_FOUND;
+        case RET_CACHE_EPERM: return UBSIO_KVC_INVALID_PARAM;
+        case RET_CACHE_BUSY:
+        case RET_CACHE_NEED_RETRY:
+        case RET_CACHE_NOT_READY:
+        case RET_CACHE_NO_SPACE:
+        case RET_CACHE_UNAVAILABLE:
+        case RET_CACHE_EXCEED_QUOTA:
+        case RET_CACHE_PT_FAULT: return UBSIO_KVC_UNAVAILABLE;
+        default: return UBSIO_KVC_BIO_ERR;
+    }
+}
+
+int32_t Location(const std::string &key, ObjLocation &location)
+{
+    return MapBio(DlBioSdkApi::CalcLocation(DlBioSdkApi::TenantId(), HashKey(key), &location));
+}
+
+int32_t Stat(const std::string &key, uint32_t &size)
+{
+    ObjLocation location{};
+    int32_t result = Location(key, location);
+    if (result != UBSIO_KVC_OK) return result;
+    ObjStat stat{};
+    result = MapBio(DlBioSdkApi::Stat(DlBioSdkApi::TenantId(), key.c_str(), location, &stat));
+    if (result == UBSIO_KVC_OK) size = stat.size;
+    return result;
+}
+
+int32_t Read(const std::string &key, void *value, uint32_t length)
+{
+    ObjLocation location{};
+    int32_t result = Location(key, location);
+    if (result != UBSIO_KVC_OK) return result;
+    uint64_t actual = 0;
+    result = MapBio(DlBioSdkApi::Get(DlBioSdkApi::TenantId(), key.c_str(), 0, length, location,
+                                      static_cast<char *>(value), &actual));
+    if (result != UBSIO_KVC_OK) return result;
+    return actual == length ? UBSIO_KVC_OK : UBSIO_KVC_CORRUPT;
+}
+
+int32_t Write(const std::string &key, const void *value, uint32_t length)
+{
+    ObjLocation location{};
+    int32_t result = Location(key, location);
+    if (result != UBSIO_KVC_OK) return result;
+    return MapBio(DlBioSdkApi::Put(DlBioSdkApi::TenantId(), key.c_str(), static_cast<const char *>(value),
+                                   length, location));
+}
+
+int32_t Remove(const std::string &key)
+{
+    ObjLocation location{};
+    int32_t result = Location(key, location);
+    if (result != UBSIO_KVC_OK) return result;
+    return MapBio(DlBioSdkApi::Delete(DlBioSdkApi::TenantId(), key.c_str(), location));
+}
+
+bool Valid(const Manifest &manifest, const std::string &key)
+{
+    if (manifest.magic != MANIFEST_MAGIC || manifest.version != MANIFEST_VERSION ||
+        manifest.keyHash != HashKey(key) || manifest.chunkBytes != CHUNK_BYTES ||
+        manifest.length == 0 || manifest.length > std::numeric_limits<uint32_t>::max()) return false;
+    return manifest.chunkCount == (manifest.length + CHUNK_BYTES - 1) / CHUNK_BYTES;
+}
+
+int32_t LoadManifest(const std::string &key, Manifest &manifest)
+{
+    const auto &directory = committed[HashKey(key) % KEY_LOCK_COUNT];
+    const auto entry = directory.find(key);
+    if (entry == directory.end()) return UBSIO_KVC_NOT_FOUND;
+    const auto expected = entry->second;
+    const auto physicalKey = ManifestKey(expected);
+    uint32_t size = 0;
+    int32_t result = Stat(physicalKey, size);
+    if (result != UBSIO_KVC_OK) return result;
+    if (size != sizeof(manifest)) return UBSIO_KVC_CORRUPT;
+    result = Read(physicalKey, &manifest, sizeof(manifest));
+    if (result != UBSIO_KVC_OK) return result;
+    return Valid(manifest, key) && std::memcmp(&manifest, &expected, sizeof(manifest)) == 0 ?
+        UBSIO_KVC_OK : UBSIO_KVC_CORRUPT;
+}
+
+std::string ManifestKey(const Manifest &manifest)
+{
+    return ChunkKey(manifest, UINT32_MAX);
+}
+
+int32_t CheckChunks(const Manifest &manifest)
+{
+    for (uint32_t index = 0; index < manifest.chunkCount; ++index) {
+        uint32_t actual = 0;
+        int32_t result = Stat(ChunkKey(manifest, index), actual);
+        const uint32_t expected = static_cast<uint32_t>(std::min<uint64_t>(
+            CHUNK_BYTES, manifest.length - static_cast<uint64_t>(index) * CHUNK_BYTES));
+        if (result == UBSIO_KVC_NOT_FOUND) return UBSIO_KVC_CORRUPT;
+        if (result != UBSIO_KVC_OK) return result;
+        if (actual != expected) return UBSIO_KVC_CORRUPT;
+    }
+    return UBSIO_KVC_OK;
+}
+
+void RemoveChunks(const Manifest &manifest)
+{
+    for (uint32_t index = 0; index < manifest.chunkCount; ++index) {
+        int32_t result = Remove(ChunkKey(manifest, index));
+        if (result != UBSIO_KVC_OK && result != UBSIO_KVC_NOT_FOUND) {
+            LOG_ERROR("Remote chunk cleanup failed, index:" << index << " result:" << result);
+            // Avoid one full network timeout per remaining chunk during an outage.
+            // Unreachable fragments are bounded by WCache and can be evicted later.
+            break;
+        }
+    }
+}
+
+} // namespace
+
+int32_t Put(const std::string &key, const void *value, size_t length)
+{
+    if (value == nullptr || length == 0 || length > std::numeric_limits<uint32_t>::max()) {
+        LOG_ERROR("Invalid remote put length:" << length);
+        return UBSIO_KVC_INVALID_PARAM;
+    }
+    std::lock_guard<std::mutex> guard(keyLocks[HashKey(key) % KEY_LOCK_COUNT]);
+    auto &directory = committed[HashKey(key) % KEY_LOCK_COUNT];
+    const auto prior = directory.find(key);
+    if (prior == directory.end() && directory.size() >= MAX_KEYS_PER_SHARD) return UBSIO_KVC_UNAVAILABLE;
+    const Manifest previous = prior == directory.end() ? Manifest{} : prior->second;
+    Manifest manifest{MANIFEST_MAGIC, NewGeneration(), HashKey(key), length, MANIFEST_VERSION,
+                      CHUNK_BYTES, static_cast<uint32_t>((length + CHUNK_BYTES - 1) / CHUNK_BYTES),
+                      Crc32(value, length)};
+    for (uint32_t index = 0; index < manifest.chunkCount; ++index) {
+        const size_t offset = static_cast<size_t>(index) * CHUNK_BYTES;
+        const uint32_t size = static_cast<uint32_t>(std::min<size_t>(CHUNK_BYTES, length - offset));
+        int32_t result = Write(ChunkKey(manifest, index), static_cast<const uint8_t *>(value) + offset, size);
+        if (result != UBSIO_KVC_OK) {
+            LOG_ERROR("Remote chunk put failed, index:" << index << " result:" << result);
+            auto partial = manifest;
+            partial.chunkCount = index + 1; // Include the possibly late current write, not unsubmitted chunks.
+            RemoveChunks(partial);
+            return result;
+        }
+    }
+    int32_t result = Write(ManifestKey(manifest), &manifest, sizeof(manifest));
+    if (result != UBSIO_KVC_OK) {
+        LOG_ERROR("Remote manifest publish failed, key:" << key << " result:" << result);
+        // Late completion can only leave an unreachable physical generation.
+        RemoveChunks(manifest);
+        Remove(ManifestKey(manifest));
+        return result;
+    }
+    directory[key] = manifest; // The only publication point, after all successful acknowledgements.
+    if (previous.magic == MANIFEST_MAGIC) {
+        RemoveChunks(previous);
+        Remove(ManifestKey(previous));
+    }
+    return UBSIO_KVC_OK;
+}
+
+int32_t Get(const std::string &key, void *value, size_t capacity)
+{
+    if (value == nullptr) return UBSIO_KVC_INVALID_PARAM;
+    std::lock_guard<std::mutex> guard(keyLocks[HashKey(key) % KEY_LOCK_COUNT]);
+    Manifest manifest{};
+    int32_t result = LoadManifest(key, manifest);
+    if (result != UBSIO_KVC_OK) return result;
+    if (capacity < manifest.length) return UBSIO_KVC_INVALID_PARAM;
+    if (capacity != manifest.length) return UBSIO_KVC_CORRUPT;
+    for (uint32_t index = 0; index < manifest.chunkCount; ++index) {
+        const size_t offset = static_cast<size_t>(index) * CHUNK_BYTES;
+        const uint32_t size = static_cast<uint32_t>(std::min<uint64_t>(CHUNK_BYTES, manifest.length - offset));
+        result = Read(ChunkKey(manifest, index), static_cast<uint8_t *>(value) + offset, size);
+        if (result == UBSIO_KVC_NOT_FOUND) return UBSIO_KVC_CORRUPT;
+        if (result != UBSIO_KVC_OK) return result;
+    }
+    if (Crc32(value, manifest.length) != manifest.dataCrc) return UBSIO_KVC_CORRUPT;
+    Manifest current{};
+    result = LoadManifest(key, current);
+    if (result != UBSIO_KVC_OK) return result;
+    return current.generation == manifest.generation ? UBSIO_KVC_OK : UBSIO_KVC_UNAVAILABLE;
+}
+
+int32_t Delete(const std::string &key)
+{
+    std::lock_guard<std::mutex> guard(keyLocks[HashKey(key) % KEY_LOCK_COUNT]);
+    auto &directory = committed[HashKey(key) % KEY_LOCK_COUNT];
+    const auto entry = directory.find(key);
+    if (entry == directory.end()) return UBSIO_KVC_NOT_FOUND;
+    const auto manifest = entry->second;
+    directory.erase(entry); // Invalidate even when the physical delete times out.
+    const auto result = Remove(ManifestKey(manifest));
+    RemoveChunks(manifest);
+    return result == UBSIO_KVC_NOT_FOUND ? UBSIO_KVC_OK : result;
+}
+
+int32_t Length(const std::string &key, uint32_t &length)
+{
+    std::lock_guard<std::mutex> guard(keyLocks[HashKey(key) % KEY_LOCK_COUNT]);
+    Manifest manifest{};
+    int32_t result = LoadManifest(key, manifest);
+    if (result != UBSIO_KVC_OK) return result;
+    result = CheckChunks(manifest);
+    if (result != UBSIO_KVC_OK) return result;
+    Manifest current{};
+    result = LoadManifest(key, current);
+    if (result != UBSIO_KVC_OK) return result;
+    if (current.generation != manifest.generation) return UBSIO_KVC_UNAVAILABLE;
+    length = static_cast<uint32_t>(manifest.length);
+    return UBSIO_KVC_OK;
+}
+
+int32_t Exist(const std::string &key)
+{
+    uint32_t length = 0;
+    return Length(key, length);
+}
+
+void ResetDirectory()
+{
+    for (size_t index = 0; index < KEY_LOCK_COUNT; ++index) {
+        std::lock_guard<std::mutex> guard(keyLocks[index]);
+        committed[index].clear();
+    }
+}
+
+} // namespace remote_dram
+} // namespace ubsio
+} // namespace ock

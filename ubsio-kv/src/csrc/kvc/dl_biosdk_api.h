@@ -111,6 +111,8 @@ public:
     }
 
     static int32_t KvBioInit();
+    static bool RemoteMode();
+    static uint64_t TenantId();
 
     static CResult BatchGetKeyDiskAddr(uint64_t tenantId, const char **keys, ObjLocation *locations,
                                        const uint32_t count, KeyAddrInfo *infos)
