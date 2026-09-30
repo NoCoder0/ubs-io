@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -32,6 +33,11 @@ void CompleteDelayed()
 }
 }
 
+uint32_t mockBatchGetCalls = 0;
+uint32_t mockBatchGetFreeCalls = 0;
+bool mockBatchGetShortRead = false;
+bool mockBatchGetGlobalFailure = false;
+
 CResult DlBioSdkApi::Stat(uint64_t, const char *key, ObjLocation, ObjStat *stat)
 {
     auto found = objects.find(key);
@@ -48,6 +54,48 @@ CResult DlBioSdkApi::Get(uint64_t, const char *key, uint64_t, uint64_t length, O
     *actual = std::min<uint64_t>(length, found->second.size());
     if (shortRead && *actual > 0) --*actual;
     std::memcpy(value, found->second.data(), *actual);
+    return RET_CACHE_OK;
+}
+
+CResult DlBioSdkApi::BatchGet(uint64_t, const char **keys, const uint32_t count, uint64_t *offsets,
+                              uint64_t *lengths, ObjLocation *, uintptr_t *addresses,
+                              uint64_t *actualLengths, int32_t *results)
+{
+    ++mockBatchGetCalls;
+    for (uint32_t i = 0; i < count; ++i) {
+        addresses[i] = 0;
+        actualLengths[i] = 0;
+        auto found = objects.find(keys[i]);
+        if (found == objects.end() || offsets[i] > found->second.size()) {
+            results[i] = bio::BIO_NOT_EXISTS;
+            continue;
+        }
+        uint64_t actual = std::min<uint64_t>(lengths[i], found->second.size() - offsets[i]);
+        if (mockBatchGetShortRead && actual > 0) --actual;
+        char *buffer = static_cast<char *>(std::malloc(actual == 0 ? 1 : actual));
+        assert(buffer != nullptr);
+        if (actual > 0) std::memcpy(buffer, found->second.data() + offsets[i], actual);
+        addresses[i] = reinterpret_cast<uintptr_t>(buffer);
+        actualLengths[i] = actual;
+        results[i] = bio::BIO_OK;
+    }
+    if (mockBatchGetGlobalFailure) {
+        for (uint32_t i = 0; i < count; ++i) {
+            std::free(reinterpret_cast<void *>(addresses[i]));
+            addresses[i] = 0;
+        }
+        return RET_CACHE_UNAVAILABLE;
+    }
+    return RET_CACHE_OK;
+}
+
+CResult DlBioSdkApi::BatchGetFree(uint64_t, uintptr_t *addresses, const uint32_t count)
+{
+    ++mockBatchGetFreeCalls;
+    for (uint32_t i = 0; i < count; ++i) {
+        std::free(reinterpret_cast<void *>(addresses[i]));
+        addresses[i] = 0;
+    }
     return RET_CACHE_OK;
 }
 
@@ -85,6 +133,34 @@ int main()
     assert(remote_dram::Length("large", length) == UBSIO_KVC_OK && length == data.size());
     assert(remote_dram::Get("large", output.data(), output.size()) == UBSIO_KVC_OK);
     assert(output == data);
+    const uint32_t batchCallsBefore = mockBatchGetCalls;
+    const uint32_t freesBefore = mockBatchGetFreeCalls;
+    assert(remote_dram::BatchGet("large", output.data(), output.size()) == UBSIO_KVC_OK);
+    assert(output == data);
+    assert(mockBatchGetCalls - batchCallsBefore == 1);
+    assert(mockBatchGetFreeCalls - freesBefore == 1);
+    assert(remote_dram::PhysicalBatchGetCallCount() == mockBatchGetCalls);
+    mockBatchGetShortRead = true;
+    const uint32_t shortReadFreeBefore = mockBatchGetFreeCalls;
+    assert(remote_dram::BatchGet("large", output.data(), output.size()) == UBSIO_KVC_CORRUPT);
+    assert(mockBatchGetFreeCalls - shortReadFreeBefore == 1);
+    mockBatchGetShortRead = false;
+    mockBatchGetGlobalFailure = true;
+    const uint32_t globalFailureFreeBefore = mockBatchGetFreeCalls;
+    assert(remote_dram::BatchGet("large", output.data(), output.size()) == UBSIO_KVC_UNAVAILABLE);
+    assert(mockBatchGetFreeCalls == globalFailureFreeBefore);
+    mockBatchGetGlobalFailure = false;
+    std::vector<char> manyChunks(17 * remote_dram::CHUNK_BYTES + 7);
+    for (size_t i = 0; i < manyChunks.size(); ++i) manyChunks[i] = static_cast<char>(i * 19);
+    assert(remote_dram::Put("many-chunks", manyChunks.data(), manyChunks.size()) == UBSIO_KVC_OK);
+    std::vector<char> manyChunksOutput(manyChunks.size());
+    const uint32_t multiCallsBefore = mockBatchGetCalls;
+    const uint32_t multiFreesBefore = mockBatchGetFreeCalls;
+    assert(remote_dram::BatchGet("many-chunks", manyChunksOutput.data(), manyChunksOutput.size()) == UBSIO_KVC_OK);
+    assert(manyChunksOutput == manyChunks);
+    assert(mockBatchGetCalls - multiCallsBefore == 2);
+    assert(mockBatchGetFreeCalls - multiFreesBefore == 2);
+    assert(remote_dram::Delete("many-chunks") == UBSIO_KVC_OK);
     assert(remote_dram::Get("large", output.data(), 10) == UBSIO_KVC_INVALID_PARAM);
     std::vector<char> oversized(data.size() + 1);
     assert(remote_dram::Get("large", oversized.data(), oversized.size()) == UBSIO_KVC_CORRUPT);

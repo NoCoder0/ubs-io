@@ -19,6 +19,7 @@
 #include "remote_dram_object_mock_api.h"
 #else
 #include "bio_c.h"
+#include "bio_err.h"
 #include "dl_biosdk_api.h"
 #include "ubsio_kvc_log.h"
 #endif
@@ -33,8 +34,10 @@ constexpr uint64_t MANIFEST_MAGIC = 0x314d41524443564bULL; // KVCDRAM1, little e
 constexpr uint32_t MANIFEST_VERSION = 1;
 constexpr size_t KEY_LOCK_COUNT = 256;
 constexpr size_t MAX_KEYS_PER_SHARD = 4096; // At most 1M logical directory entries per SDK.
+constexpr uint32_t BATCH_GET_WIDTH = 16;
 std::array<std::mutex, KEY_LOCK_COUNT> keyLocks;
 std::atomic<uint64_t> generationCounter{1};
+thread_local uint64_t physicalBatchGetCalls = 0;
 
 struct Manifest {
     uint64_t magic;
@@ -122,6 +125,50 @@ int32_t MapBio(CResult result)
         default: return UBSIO_KVC_BIO_ERR;
     }
 }
+
+int32_t MapBioBatchResult(int32_t result)
+{
+    switch (result) {
+        case bio::BIO_OK: return UBSIO_KVC_OK;
+        case bio::BIO_NOT_EXISTS: return UBSIO_KVC_NOT_FOUND;
+        case bio::BIO_CRC_ERR: return UBSIO_KVC_CORRUPT;
+        case bio::BIO_INVALID_PARAM: return UBSIO_KVC_INVALID_PARAM;
+        case bio::BIO_NOT_READY:
+        case bio::BIO_ALLOC_FAIL:
+        case bio::BIO_CHECK_PT_FAIL:
+        case bio::BIO_INNER_RETRY:
+        case bio::BIO_NET_RETRY:
+        case bio::BIO_QUOTA_NOT_ENOUGH:
+        case bio::BIO_QUOTA_TIMEOUT: return UBSIO_KVC_UNAVAILABLE;
+        default: return UBSIO_KVC_BIO_ERR;
+    }
+}
+
+class BatchGetBufferGuard {
+public:
+    explicit BatchGetBufferGuard(std::vector<uintptr_t> &addresses)
+        : mAddresses(addresses), mOwned(true) {}
+
+    ~BatchGetBufferGuard()
+    {
+        if (mOwned && DlBioSdkApi::BatchGetFree(DlBioSdkApi::TenantId(), mAddresses.data(),
+            static_cast<uint32_t>(mAddresses.size())) != RET_CACHE_OK) {
+            LOG_ERROR("Remote batch-get buffer release failed");
+        }
+    }
+
+    int32_t Free()
+    {
+        if (!mOwned) return UBSIO_KVC_OK;
+        mOwned = false;
+        return MapBio(DlBioSdkApi::BatchGetFree(DlBioSdkApi::TenantId(), mAddresses.data(),
+            static_cast<uint32_t>(mAddresses.size())));
+    }
+
+private:
+    std::vector<uintptr_t> &mAddresses;
+    bool mOwned;
+};
 
 int32_t Location(const std::string &key, ObjLocation &location)
 {
@@ -290,6 +337,79 @@ int32_t Get(const std::string &key, void *value, size_t capacity)
     result = LoadManifest(key, current);
     if (result != UBSIO_KVC_OK) return result;
     return current.generation == manifest.generation ? UBSIO_KVC_OK : UBSIO_KVC_UNAVAILABLE;
+}
+
+int32_t BatchGet(const std::string &key, void *value, size_t capacity)
+{
+    if (value == nullptr) return UBSIO_KVC_INVALID_PARAM;
+    std::lock_guard<std::mutex> guard(keyLocks[HashKey(key) % KEY_LOCK_COUNT]);
+    Manifest manifest{};
+    int32_t result = LoadManifest(key, manifest);
+    if (result != UBSIO_KVC_OK) return result;
+    if (capacity < manifest.length) return UBSIO_KVC_INVALID_PARAM;
+    if (capacity != manifest.length) return UBSIO_KVC_CORRUPT;
+
+    for (uint32_t first = 0; first < manifest.chunkCount;) {
+        const uint32_t count = std::min<uint32_t>(BATCH_GET_WIDTH, manifest.chunkCount - first);
+        std::vector<std::string> physicalKeys(count);
+        std::vector<const char *> keys(count);
+        std::vector<ObjLocation> locations(count);
+        std::vector<uint64_t> offsets(count, 0);
+        std::vector<uint64_t> lengths(count);
+        std::vector<uintptr_t> addresses(count, 0);
+        std::vector<uint64_t> realLengths(count, 0);
+        std::vector<int32_t> itemResults(count, bio::BIO_OK);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t index = first + i;
+            const size_t offset = static_cast<size_t>(index) * CHUNK_BYTES;
+            physicalKeys[i] = ChunkKey(manifest, index);
+            keys[i] = physicalKeys[i].c_str();
+            lengths[i] = std::min<uint64_t>(CHUNK_BYTES, manifest.length - offset);
+            result = Location(physicalKeys[i], locations[i]);
+            if (result != UBSIO_KVC_OK) return result;
+        }
+
+        const CResult batchResult = DlBioSdkApi::BatchGet(DlBioSdkApi::TenantId(), keys.data(), count,
+            offsets.data(), lengths.data(), locations.data(), addresses.data(), realLengths.data(),
+            itemResults.data());
+        ++physicalBatchGetCalls;
+        // BatchGetImpl releases every allocated address when the overall call fails.
+        if (batchResult != RET_CACHE_OK) return MapBio(batchResult);
+
+        BatchGetBufferGuard buffers(addresses);
+        int32_t itemError = UBSIO_KVC_OK;
+        for (uint32_t i = 0; i < count; ++i) {
+            int32_t itemResult = MapBioBatchResult(itemResults[i]);
+            if (itemResult == UBSIO_KVC_NOT_FOUND) itemResult = UBSIO_KVC_CORRUPT;
+            if (itemResult == UBSIO_KVC_OK &&
+                (addresses[i] == 0 || realLengths[i] != lengths[i])) {
+                itemResult = UBSIO_KVC_CORRUPT;
+            }
+            if (itemError == UBSIO_KVC_OK && itemResult != UBSIO_KVC_OK) itemError = itemResult;
+        }
+        if (itemError != UBSIO_KVC_OK) return itemError;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const size_t offset = static_cast<size_t>(first + i) * CHUNK_BYTES;
+            std::memcpy(static_cast<uint8_t *>(value) + offset,
+                reinterpret_cast<const void *>(addresses[i]), static_cast<size_t>(lengths[i]));
+        }
+        result = buffers.Free();
+        if (result != UBSIO_KVC_OK) return result;
+        first += count;
+    }
+
+    if (Crc32(value, manifest.length) != manifest.dataCrc) return UBSIO_KVC_CORRUPT;
+    Manifest current{};
+    result = LoadManifest(key, current);
+    if (result != UBSIO_KVC_OK) return result;
+    return current.generation == manifest.generation ? UBSIO_KVC_OK : UBSIO_KVC_UNAVAILABLE;
+}
+
+uint64_t PhysicalBatchGetCallCount()
+{
+    return physicalBatchGetCalls;
 }
 
 int32_t Delete(const std::string &key)
