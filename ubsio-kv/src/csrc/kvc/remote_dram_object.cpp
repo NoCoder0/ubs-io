@@ -15,6 +15,11 @@
 #include <mutex>
 #include <random>
 #include <unistd.h>
+#if defined(__aarch64__) && defined(__linux__)
+#include <arm_acle.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 #ifdef UBSIO_REMOTE_DRAM_OBJECT_MOCK
 #include "remote_dram_object_mock_api.h"
 #else
@@ -65,7 +70,7 @@ uint64_t HashKey(const std::string &key)
     return hash;
 }
 
-uint32_t Crc32(const void *data, size_t length)
+uint32_t Crc32Software(const void *data, size_t length)
 {
     static const auto table = []() {
         std::array<uint32_t, 256> values{};
@@ -84,6 +89,48 @@ uint32_t Crc32(const void *data, size_t length)
         crc = table[(crc ^ bytes[i]) & 0xffU] ^ (crc >> 8);
     }
     return ~crc;
+}
+
+
+#if defined(__aarch64__) && defined(__linux__)
+// IEEE CRC32 (not CRC32C): preserve the existing manifest and data CRC format.
+__attribute__((target("+crc")))
+uint32_t Crc32Hardware(const void *data, size_t length)
+{
+    uint32_t crc = ~0U;
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    while (length >= sizeof(uint64_t)) {
+        uint64_t word;
+        // Safe for unaligned buffers and strict aliasing; no read past length.
+        std::memcpy(&word, bytes, sizeof(word));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        word = __builtin_bswap64(word);
+#endif
+        crc = __crc32d(crc, word);
+        bytes += sizeof(word);
+        length -= sizeof(word);
+    }
+    while (length-- != 0) crc = __crc32b(crc, *bytes++);
+    return ~crc;
+}
+#endif
+
+bool HasHardwareCrc32()
+{
+#if defined(__aarch64__) && defined(__linux__)
+    static const bool available = (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+    return available;
+#else
+    return false;
+#endif
+}
+
+uint32_t Crc32(const void *data, size_t length)
+{
+#if defined(__aarch64__) && defined(__linux__)
+    if (HasHardwareCrc32()) return Crc32Hardware(data, length);
+#endif
+    return Crc32Software(data, length);
 }
 
 uint64_t NewGeneration()
@@ -273,6 +320,12 @@ void RemoveChunks(const Manifest &manifest)
 }
 
 } // namespace
+
+#ifdef UBSIO_REMOTE_DRAM_OBJECT_MOCK
+uint32_t Crc32ForTest(const void *data, size_t length) { return Crc32(data, length); }
+uint32_t Crc32SoftwareForTest(const void *data, size_t length) { return Crc32Software(data, length); }
+bool HasHardwareCrc32ForTest() { return HasHardwareCrc32(); }
+#endif
 
 int32_t Put(const std::string &key, const void *value, size_t length)
 {

@@ -9,6 +9,11 @@
 #include "remote_dram_object_mock_api.h"
 #include "ubsio_kvc_err.h"
 
+namespace ock { namespace ubsio { namespace remote_dram {
+uint32_t Crc32ForTest(const void *, size_t);
+uint32_t Crc32SoftwareForTest(const void *, size_t);
+bool HasHardwareCrc32ForTest();
+}}}
 using namespace ock::ubsio;
 namespace {
 std::map<std::string, std::vector<char>> objects;
@@ -123,13 +128,49 @@ CResult DlBioSdkApi::Delete(uint64_t, const char *key, ObjLocation)
     return objects.erase(key) ? RET_CACHE_OK : RET_CACHE_NOT_FOUND;
 }
 
+
+void TestCompatibleCrc()
+{
+    using namespace remote_dram;
+    const char *known = "123456789";
+    assert(Crc32ForTest(nullptr, 0) == 0);
+    assert(Crc32SoftwareForTest(nullptr, 0) == 0);
+    assert(Crc32ForTest(known, 9) == 0xcbf43926U);
+    assert(Crc32SoftwareForTest(known, 9) == 0xcbf43926U);
+    std::vector<uint8_t> data(41943040U + 8);
+    uint32_t state = 0x7183U;
+    for (auto &b : data) { state = state * 1664525U + 1013904223U; b = state >> 24; }
+    std::vector<size_t> lengths;
+    for (size_t n = 0; n < 130; ++n) lengths.push_back(n);
+    for (size_t n : {1048575U, 1048576U, 1048577U, 21463040U, 41943040U}) lengths.push_back(n);
+    for (size_t n : lengths) {
+        for (size_t offset = 0; offset < 8; ++offset) {
+            const auto expected = Crc32SoftwareForTest(data.data() + offset, n);
+            assert(Crc32ForTest(data.data() + offset, n) == expected);
+        }
+    }
+    std::cout << "CRC32 IEEE known vector, software fallback, tails, unaligned and large payload PASS; hardware="
+              << HasHardwareCrc32ForTest() << '\n';
+}
+
 int main()
 {
+    TestCompatibleCrc();
     std::vector<char> data(remote_dram::CHUNK_BYTES + 13);
     for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<char>(i * 37);
     std::vector<char> output(data.size());
     uint32_t length = 0;
     assert(remote_dram::Put("large", data.data(), data.size()) == UBSIO_KVC_OK);
+    for (auto &entry : objects) {
+        if (!IsManifest(entry.first)) continue;
+        uint32_t writtenCrc;
+        assert(entry.second.size() == 48);
+        std::memcpy(&writtenCrc, entry.second.data() + 44, sizeof(writtenCrc));
+        assert(writtenCrc == remote_dram::Crc32SoftwareForTest(data.data(), data.size()));
+        // Read a manifest CRC produced by the old implementation with the new reader.
+        const uint32_t oldCrc = remote_dram::Crc32SoftwareForTest(data.data(), data.size());
+        std::memcpy(entry.second.data() + 44, &oldCrc, sizeof(oldCrc));
+    }
     assert(remote_dram::Length("large", length) == UBSIO_KVC_OK && length == data.size());
     assert(remote_dram::Get("large", output.data(), output.size()) == UBSIO_KVC_OK);
     assert(output == data);
@@ -179,6 +220,7 @@ int main()
     assert(chunk != objects.end());
     chunk->second[0] ^= 1;
     assert(remote_dram::Get("large", output.data(), output.size()) == UBSIO_KVC_CORRUPT);
+    assert(remote_dram::BatchGet("large", output.data(), output.size()) == UBSIO_KVC_CORRUPT);
     chunk->second[0] ^= 1;
     objects.erase(chunk->first);
     assert(remote_dram::Exist("large") == UBSIO_KVC_CORRUPT);
