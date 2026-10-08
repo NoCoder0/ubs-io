@@ -42,7 +42,6 @@ constexpr size_t MAX_KEYS_PER_SHARD = 4096; // At most 1M logical directory entr
 constexpr uint32_t BATCH_GET_WIDTH = 16;
 std::array<std::mutex, KEY_LOCK_COUNT> keyLocks;
 std::atomic<uint64_t> generationCounter{1};
-thread_local uint64_t physicalBatchGetCalls = 0;
 
 struct Manifest {
     uint64_t magic;
@@ -426,7 +425,6 @@ int32_t BatchGet(const std::string &key, void *value, size_t capacity)
         const CResult batchResult = DlBioSdkApi::BatchGet(DlBioSdkApi::TenantId(), keys.data(), count,
             offsets.data(), lengths.data(), locations.data(), addresses.data(), realLengths.data(),
             itemResults.data());
-        ++physicalBatchGetCalls;
         // BatchGetImpl releases every allocated address when the overall call fails.
         if (batchResult != RET_CACHE_OK) return MapBio(batchResult);
 
@@ -458,11 +456,6 @@ int32_t BatchGet(const std::string &key, void *value, size_t capacity)
     result = LoadManifest(key, current);
     if (result != UBSIO_KVC_OK) return result;
     return current.generation == manifest.generation ? UBSIO_KVC_OK : UBSIO_KVC_UNAVAILABLE;
-}
-
-uint64_t PhysicalBatchGetCallCount()
-{
-    return physicalBatchGetCalls;
 }
 
 int32_t Delete(const std::string &key)

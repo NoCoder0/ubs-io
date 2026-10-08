@@ -701,26 +701,22 @@ BResult MirrorClient::InitializeRemotePlacement()
     }
     const char *ipList = std::getenv("UBSIO_KVC_REMOTE_IPS");
     if (ipList == nullptr) {
-        CLIENT_LOG_ERROR("Remote DRAM requires UBSIO_KVC_REMOTE_IPS with two IPv4 addresses.");
+        CLIENT_LOG_ERROR("Remote DRAM requires UBSIO_KVC_REMOTE_IPS with comma-separated IPv4 addresses.");
         return BIO_INVALID_PARAM;
     }
     const std::string configured(ipList);
-    const size_t separator = configured.find(',');
-    if (separator == std::string::npos || configured.find(',', separator + 1) != std::string::npos) {
-        CLIENT_LOG_ERROR("Remote DRAM requires exactly two comma-separated IPv4 addresses.");
-        return BIO_INVALID_PARAM;
-    }
-    for (const auto &ip : {configured.substr(0, separator), configured.substr(separator + 1)}) {
+    for (size_t start = 0; start <= configured.size();) {
+        const size_t separator = configured.find(',', start);
+        const std::string ip = configured.substr(start, separator == std::string::npos ? separator : separator - start);
         in_addr address{};
         if (inet_pton(AF_INET, ip.c_str(), &address) != 1 || !mRemoteIps.insert(ip).second) {
             CLIENT_LOG_ERROR("Invalid or duplicate remote DRAM IP:" << ip);
             return BIO_INVALID_PARAM;
         }
+        if (separator == std::string::npos) break;
+        start = separator + 1;
     }
-    if (mRemoteIps.size() != 2) {
-        CLIENT_LOG_ERROR("Remote DRAM requires exactly two distinct TCP hosts, count:" << mRemoteIps.size());
-        return BIO_INVALID_PARAM;
-    }
+    const size_t remoteNodeCount = mRemoteIps.size();
     std::map<uint16_t, std::string> remoteNodes;
     ReadLocker<ReadWriteLock> viewGuard(&mLock);
     for (const auto &node : mNodeView) {
@@ -731,8 +727,8 @@ BResult MirrorClient::InitializeRemotePlacement()
         }
         remoteNodes.emplace(node.second.id.VNodeId(), node.second.ip);
     }
-    if (remoteNodes.size() != 2) {
-        CLIENT_LOG_ERROR("Both configured remote DRAM hosts must appear in the node view, found:" << remoteNodes.size());
+    if (remoteNodes.size() != remoteNodeCount) {
+        CLIENT_LOG_ERROR("All configured remote DRAM hosts must appear in the node view, found:" << remoteNodes.size());
         return BIO_CHECK_PT_FAIL;
     }
     std::set<uint16_t> masters;
@@ -744,8 +740,8 @@ BResult MirrorClient::InitializeRemotePlacement()
         mRemotePtMasters.emplace(entry.first, pt.masterNodeId);
         masters.insert(pt.masterNodeId);
     }
-    if (masters.size() != 2) {
-        CLIENT_LOG_ERROR("No healthy single-copy partitions on both configured remote hosts.");
+    if (masters.size() != remoteNodeCount) {
+        CLIENT_LOG_ERROR("No healthy single-copy partitions on all configured remote hosts.");
         return BIO_CHECK_PT_FAIL;
     }
     mRemoteDramMode = true;

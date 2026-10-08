@@ -73,7 +73,7 @@ void BioConfig::LoadDefaultConf()
     AddStrConf(WORK_SCENE, VStrEnum::Create(WORK_SCENE.first, "none||bigdata"));
     AddIntConf(WORK_IO_ALIGNSIZE, VIntRange::Create(WORK_IO_ALIGNSIZE.first, NO_1, NO_4194304));
     AddIntConf(WORK_IO_TIMEOUT, VIntRange::Create(WORK_IO_TIMEOUT.first, NO_60, NO_300));
-    AddIntConf(WORK_NET_TIMEOUT, VIntRange::Create(WORK_NET_TIMEOUT.first, NO_16, NO_128));
+    AddIntConf(WORK_NET_TIMEOUT, VIntRange::Create(WORK_NET_TIMEOUT.first, NO_16, NO_300));
     AddIntConf(BATCH_GET_THREAD_NUM, VIntRange::Create(BATCH_GET_THREAD_NUM.first, NO_8, NO_512));
     AddIntConf(BDM_BATCH_READ_WINDOW_KEYS, VIntRange::Create(BDM_BATCH_READ_WINDOW_KEYS.first, NO_1, NO_1024));
     AddIntConf(BDM_BATCH_READ_WINDOW_BYTES_MB,

@@ -17,7 +17,6 @@ constexpr uint32_t CHUNK_BYTES = 1024U * 1024U;
 int32_t Put(const std::string &key, const void *value, size_t length);
 int32_t Get(const std::string &key, void *value, size_t capacity);
 int32_t BatchGet(const std::string &key, void *value, size_t capacity);
-uint64_t PhysicalBatchGetCallCount();
 int32_t Delete(const std::string &key);
 int32_t Length(const std::string &key, uint32_t &length);
 int32_t Exist(const std::string &key);

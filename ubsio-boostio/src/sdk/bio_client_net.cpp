@@ -515,7 +515,7 @@ bool BioClientNet::CheckShmInitResp(ShmInitResponse rsp)
 {
     bool validAlignSize = rsp.alignSize <= NO_4194304 && rsp.alignSize >= NO_1;
     bool validIoTimeOut = rsp.ioTimeOut >= NO_60 && rsp.ioTimeOut <= NO_300;
-    bool validNetTimeOut = rsp.netTimeOut >= NO_16 && rsp.netTimeOut <= NO_128;
+    bool validNetTimeOut = rsp.netTimeOut >= NO_16 && rsp.netTimeOut <= NO_300;
     bool validLogLevel = rsp.logLevel <= NO_4;
     bool validScene = rsp.scene <= NO_1;
     return validAlignSize && validIoTimeOut && validNetTimeOut && validLogLevel && validScene;
@@ -525,7 +525,7 @@ bool BioClientNet::CheckRuntimeConfigResp(StandaloneRuntimeConfigResponse rsp)
 {
     bool validAlignSize = rsp.alignSize <= NO_4194304 && rsp.alignSize >= NO_1;
     bool validIoTimeOut = rsp.ioTimeOut >= NO_60 && rsp.ioTimeOut <= NO_300;
-    bool validNetTimeOut = rsp.netTimeOut >= NO_16 && rsp.netTimeOut <= NO_128;
+    bool validNetTimeOut = rsp.netTimeOut >= NO_16 && rsp.netTimeOut <= NO_300;
     bool validLogLevel = rsp.logLevel <= NO_4;
     bool validScene = rsp.scene <= NO_1;
     return validAlignSize && validIoTimeOut && validNetTimeOut && validLogLevel && validScene;

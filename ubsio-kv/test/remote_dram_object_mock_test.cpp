@@ -180,7 +180,6 @@ int main()
     assert(output == data);
     assert(mockBatchGetCalls - batchCallsBefore == 1);
     assert(mockBatchGetFreeCalls - freesBefore == 1);
-    assert(remote_dram::PhysicalBatchGetCallCount() == mockBatchGetCalls);
     mockBatchGetShortRead = true;
     const uint32_t shortReadFreeBefore = mockBatchGetFreeCalls;
     assert(remote_dram::BatchGet("large", output.data(), output.size()) == UBSIO_KVC_CORRUPT);

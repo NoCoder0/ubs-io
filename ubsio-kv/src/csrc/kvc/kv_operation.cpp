@@ -185,12 +185,9 @@ int32_t KvOperation::BatchKvGetData(const std::vector<std::string> &key, void **
         if (bufs == nullptr || lengths.size() != key.size() || results.size() < key.size()) {
             return UBSIO_KVC_INVALID_PARAM;
         }
-        const uint64_t physicalCallsBefore = remote_dram::PhysicalBatchGetCallCount();
         for (size_t i = 0; i < key.size(); ++i) {
             results[i] = remote_dram::BatchGet(key[i], bufs[i], lengths[i]);
         }
-        LOG_INFO("Remote BatchKvGetData objects:" << key.size() << " physical SDK BatchGet calls:"
-            << remote_dram::PhysicalBatchGetCallCount() - physicalCallsBefore);
         return UBSIO_KVC_OK;
     }
     uint32_t keysCount = key.size();
