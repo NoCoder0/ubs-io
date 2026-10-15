@@ -23,6 +23,18 @@ extern "C" {
 #define UBSIO_RESOURCE_DISK_PATH_MAX_SIZE (256)
 #define UBSIO_RESOURCE_MAX_DISK_NUM (16)
 
+typedef enum {
+    UBSIO_KVC_MODE_STANDALONE_C = 0,
+    UBSIO_KVC_MODE_REMOTE_DRAM_TCP_C = 1,
+} UbsioKvcModeC;
+
+/** Prepare startup configuration before callback registration or initialization.
+ * No network/cache is started. NULL/empty path uses UBSIO_CONFIG_PATH or the default.
+ * Repeating the same absolute path returns the immutable snapshot; a different path fails.
+ * mode is written only on success. This process supports one startup configuration.
+ */
+int32_t UbsioKvCachePrepareConfig(const char *path, uint32_t *mode);
+
 typedef struct {
     uint16_t status;
     char path[UBSIO_RESOURCE_DISK_PATH_MAX_SIZE];

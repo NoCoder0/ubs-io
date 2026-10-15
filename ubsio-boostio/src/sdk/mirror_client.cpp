@@ -21,6 +21,9 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <cstdlib>
+#include <cstring>
 #include "bio_tracepoint_helper.h"
 #include "bio_client_log.h"
 #include "bio_trace.h"
@@ -32,6 +35,7 @@
 #include "bio_monotonic.h"
 #include "bio_crc_util.h"
 #include "mirror_client.h"
+#include "bio_kvc_config.h"
 
 using namespace ock::bio;
 
@@ -304,11 +308,12 @@ BResult MirrorClient::DestroyFlow(uint16_t ptId, uint64_t flowId)
 
 BResult MirrorClient::LoadAffinityFlow()
 {
-    std::vector<uint16_t> ptVec = ListLocalAffinityPt();
+    std::vector<uint16_t> ptVec = mRemoteDramMode ? mRemotePtIds : ListLocalAffinityPt();
     for (uint16_t &ptId : ptVec) {
         BResult ret = CreateFlow(ptId);
         if (UNLIKELY(ret != BIO_OK)) {
             CLIENT_LOG_ERROR("Create affinity flow instance failed, ret:" << ret << ", ptId:" << ptId << ".");
+            if (mRemoteDramMode) return ret;
         } else {
             CLIENT_LOG_INFO("Load affinity flow success, ptId:" << ptId << ".");
         }
@@ -663,6 +668,10 @@ void MirrorClient::Exit()
         mBatchExistExecutor = nullptr;
     }
     FreeIoStrategy();
+    mRemoteDramMode = false;
+    mRemoteIps.clear();
+    mRemotePtMasters.clear();
+    mRemotePtIds.clear();
 }
 
 std::vector<uint16_t> MirrorClient::ListLocalAffinityPt()
@@ -677,6 +686,66 @@ std::vector<uint16_t> MirrorClient::ListLocalAffinityPt()
     }
     mLock.UnLock();
     return ans;
+}
+
+BResult MirrorClient::InitializeRemotePlacement()
+{
+    mRemoteDramMode = false;
+    mRemoteIps.clear();
+    mRemotePtMasters.clear();
+    mRemotePtIds.clear();
+    const auto config = GetBioKvcSnapshot();
+    if (!config || !config->values.remote) return BIO_OK;
+    if (mMode != SEPARATES || mNetProtocol != 1) {
+        CLIENT_LOG_ERROR("Remote DRAM requires SEPARATES and the configured TCP transport, protocol:" << mNetProtocol);
+        return BIO_INVALID_PARAM;
+    }
+    mRemoteIps = config->values.remoteIps;
+    const size_t remoteNodeCount = mRemoteIps.size();
+    std::map<uint16_t, std::string> remoteNodes;
+    ReadLocker<ReadWriteLock> viewGuard(&mLock);
+    for (const auto &node : mNodeView) {
+        if (mRemoteIps.count(node.second.ip) == 0) continue;
+        if (node.second.id.VNodeId() == mLocalNid.VNodeId() || node.second.status != CM_NODE_NORMAL) {
+            CLIENT_LOG_ERROR("Remote DRAM host is local or unhealthy, ip:" << node.second.ip);
+            return BIO_CHECK_PT_FAIL;
+        }
+        remoteNodes.emplace(node.second.id.VNodeId(), node.second.ip);
+    }
+    if (remoteNodes.size() != remoteNodeCount) {
+        CLIENT_LOG_ERROR("All configured remote DRAM hosts must appear in the node view, found:" << remoteNodes.size());
+        return BIO_CHECK_PT_FAIL;
+    }
+    std::set<uint16_t> masters;
+    for (const auto &entry : mPtView) {
+        const auto &pt = entry.second;
+        if (remoteNodes.count(pt.masterNodeId) == 0 || pt.state != CM_PT_NORMAL || pt.copys.size() != 1 ||
+            pt.copys[0].nodeId != pt.masterNodeId || pt.copys[0].state != CM_COPY_RUNNING) continue;
+        mRemotePtIds.push_back(entry.first);
+        mRemotePtMasters.emplace(entry.first, pt.masterNodeId);
+        masters.insert(pt.masterNodeId);
+    }
+    if (masters.size() != remoteNodeCount) {
+        CLIENT_LOG_ERROR("No healthy single-copy partitions on all configured remote hosts.");
+        return BIO_CHECK_PT_FAIL;
+    }
+    mRemoteDramMode = true;
+    CLIENT_LOG_INFO("Frozen remote DRAM TCP partition count:" << mRemotePtIds.size());
+    return BIO_OK;
+}
+
+bool MirrorClient::RemotePtValid(uint16_t ptId, const CmPtInfo &ptEntry) const
+{
+    auto frozen = mRemotePtMasters.find(ptId);
+    if (frozen == mRemotePtMasters.end() || frozen->second != ptEntry.masterNodeId ||
+        ptEntry.state != CM_PT_NORMAL || ptEntry.copys.size() != 1 ||
+        ptEntry.copys[0].nodeId != ptEntry.masterNodeId || ptEntry.copys[0].state != CM_COPY_RUNNING) return false;
+    for (const auto &node : mNodeView) {
+        if (node.second.id.VNodeId() == ptEntry.masterNodeId) {
+            return node.second.status == CM_NODE_NORMAL && mRemoteIps.count(node.second.ip) != 0;
+        }
+    }
+    return false;
 }
 
 uint16_t MirrorClient::SelectingPt(uint64_t objectId, AffinityStrategy affinity)
@@ -707,7 +776,11 @@ uint16_t MirrorClient::SelectingPtImpl(uint64_t objectId, AffinityStrategy affin
 {
     size_t v = std::hash<std::uint64_t>{}(objectId);
     uint16_t ptId = UINT16_MAX;
-    if (LIKELY(affinity == LOCAL_AFFINITY)) {
+    if (mRemoteDramMode && affinity != GLOBAL_BALANCE) {
+        CLIENT_LOG_ERROR("Remote DRAM cache used with non-global affinity, objectId:" << objectId);
+    } else if (mRemoteDramMode && affinity == GLOBAL_BALANCE) {
+        if (!mRemotePtIds.empty()) ptId = mRemotePtIds[v % mRemotePtIds.size()];
+    } else if (LIKELY(affinity == LOCAL_AFFINITY)) {
         std::vector<uint16_t> ptVec = ListLocalAffinityPt();
         if (!ptVec.empty()) {
             ptId = ptVec[v % ptVec.size()];
@@ -754,6 +827,11 @@ BResult MirrorClient::GetPtEntry(uint16_t ptId, CmPtInfo &ptEntry)
         mLock.UnLock();
         return BIO_CHECK_PT_FAIL;
     }
+    if (mRemoteDramMode && !RemotePtValid(ptId, iter->second)) {
+        CLIENT_LOG_ERROR("Remote DRAM partition changed or is outside frozen placement, ptId:" << ptId << ".");
+        mLock.UnLock();
+        return BIO_CHECK_PT_FAIL;
+    }
 
     ptEntry = iter->second;
     mLock.UnLock();
@@ -789,6 +867,8 @@ BResult MirrorClient::Initialize(UpdateView updateView, uint32_t scene, uint32_t
         CLIENT_LOG_ERROR("Sdk load origin view failed, ret:" << ret << ".");
         return ret;
     }
+    ret = InitializeRemotePlacement();
+    if (ret != BIO_OK) return ret;
 
     // 初始化client端的QOS控制
     ret = InitializeBioQos();

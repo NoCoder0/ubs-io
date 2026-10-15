@@ -1,0 +1,13 @@
+# Apply to the COMPLETE D client configuration; replace deployment TLS paths before use.
+# Four remote storage nodes are separate from CM's five-node setting (including the client).
+ubsio.kvc.mode = remote_dram_tcp
+ubsio.kvc.tenant_id = 71
+ubsio.kvc.remote_ips = 10.1.101.177,10.1.101.178,10.1.101.27,10.1.101.32
+ubsio.kvc.read_workers = 4
+ubsio.kvc.manifest_one_get = false
+ubsio.net.data.protocol = tcp
+ubsio.work.net.timeout = 300
+ubsio.net.tls.enable.switch = true
+ubsio.net.tls.ca.cert.path = /task-root/kunpeng-dram-V2/tls/ca.crt
+ubsio.net.tls.server.cert.path = /task-root/kunpeng-dram-V2/tls/a3_10.1.101.22.crt
+ubsio.net.tls.server.key.path = /task-root/kunpeng-dram-V2/tls/a3_10.1.101.22.key

@@ -29,6 +29,11 @@ constexpr uint32_t DISK_PATH_CONFIG_MAX_NUM = DEVICE_SIZE * NO_4;
 
 void BioConfig::LoadDefaultConf()
 {
+    AddStrConf(KVC_MODE, VStrEnum::Create(KVC_MODE.first, "standalone||remote_dram_tcp"));
+    AddStrConf(KVC_TENANT_ID);
+    AddStrConf(KVC_REMOTE_IPS);
+    AddStrConf(KVC_READ_WORKERS, VStrEnum::Create(KVC_READ_WORKERS.first, "2||4"));
+    AddStrConf(KVC_MANIFEST_ONE_GET, VStrEnum::Create(KVC_MANIFEST_ONE_GET.first, "true||false"));
     /* load net config for fs */
     AddStrConf(NET_DATA_PROTOCOL, VStrEnum::Create(NET_DATA_PROTOCOL.first, "tcp||rdma"));
     AddStrConf(NET_RPC_DATA_BUSY_POLL_MODE, VStrBoolRange::Create(NET_RPC_DATA_BUSY_POLL_MODE.first));
@@ -73,7 +78,7 @@ void BioConfig::LoadDefaultConf()
     AddStrConf(WORK_SCENE, VStrEnum::Create(WORK_SCENE.first, "none||bigdata"));
     AddIntConf(WORK_IO_ALIGNSIZE, VIntRange::Create(WORK_IO_ALIGNSIZE.first, NO_1, NO_4194304));
     AddIntConf(WORK_IO_TIMEOUT, VIntRange::Create(WORK_IO_TIMEOUT.first, NO_60, NO_300));
-    AddIntConf(WORK_NET_TIMEOUT, VIntRange::Create(WORK_NET_TIMEOUT.first, NO_16, NO_128));
+    AddIntConf(WORK_NET_TIMEOUT, VIntRange::Create(WORK_NET_TIMEOUT.first, NO_16, NO_300));
     AddIntConf(BATCH_GET_THREAD_NUM, VIntRange::Create(BATCH_GET_THREAD_NUM.first, NO_8, NO_512));
     AddIntConf(BDM_BATCH_READ_WINDOW_KEYS, VIntRange::Create(BDM_BATCH_READ_WINDOW_KEYS.first, NO_1, NO_1024));
     AddIntConf(BDM_BATCH_READ_WINDOW_BYTES_MB,
@@ -120,6 +125,18 @@ void BioConfig::LoadDefaultConf()
 
 BResult BioConfig::AutoConfAfterLoadFromFile(const ConfigurationPtr &conf)
 {
+    KvcConfigValues kvc;
+    std::string error;
+    if (!ParseKvcValues(conf->GetStr(KVC_MODE.first), conf->GetStr(KVC_TENANT_ID.first),
+        conf->GetStr(KVC_REMOTE_IPS.first), conf->GetStr(KVC_READ_WORKERS.first),
+        conf->GetStr(KVC_MANIFEST_ONE_GET.first), kvc, error)) {
+        LOG_ERROR("Invalid KVC configuration, key:" << error);
+        return BIO_INVALID_PARAM;
+    }
+    if (kvc.remote && conf->GetStr(NET_DATA_PROTOCOL.first) != "tcp") {
+        LOG_ERROR("ubsio.net.data.protocol must be tcp for remote_dram_tcp");
+        return BIO_INVALID_PARAM;
+    }
     auto ret = AutoConfigNet(conf);
     ChkTrueNot(ret == BIO_OK, ret);
 

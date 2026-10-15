@@ -47,6 +47,13 @@ aux_source_directory(common BIO_TEST)
 aux_source_directory(underfs BIO_TEST)
 add_executable(bio_test ${BIO_TEST} main.cpp ut_common.cpp ut_common.h)
 
+# Startup configuration tests must not inherit bio_test's live SDK/network threads.
+add_executable(bio_kvc_config_test sdk/config/bio_kvc_config_test.cpp)
+target_include_directories(bio_kvc_config_test PRIVATE
+        ${SRC_DIR}/sdk
+        ${PROJECT_OUTPUT_PATH}/boostio_test_tools/googletest/include/)
+target_link_libraries(bio_kvc_config_test bio_sdk ${GTEST_LIBRARY} pthread)
+
 set(TEST_DIR ${PROJECT_SOURCE_DIR})
 target_include_directories(bio_test PRIVATE
         ${TEST_DIR}/mock

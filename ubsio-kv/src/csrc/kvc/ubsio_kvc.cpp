@@ -30,13 +30,25 @@ constexpr int MAX_KV_LAYER_NUM = 2 * 512; // k layer + v layer
 constexpr int64_t MAX_KV_LAYER_LENGTH = 2 * 1024 * 1024 * 1024LL; // 2G
 }
 
+UBSIO_API int32_t UbsioKvCachePrepareConfig(const char *path, uint32_t *mode)
+{
+    try {
+        return DlBioSdkApi::PrepareConfig(path, mode);
+    } catch (...) {
+        return UBSIO_KVC_ERR;
+    }
+}
+
 UBSIO_API int32_t UbsioKvCacheInit(int32_t devId)
 {
     if (UNLIKELY(devId < -1)) {
         LOG_ERROR("Invalid device id: " << devId);
         return UBSIO_KVC_INVALID_PARAM;
     }
-    int32_t ret = KvcInstance::Instance().Initialize(devId);
+    uint32_t mode = UBSIO_KVC_MODE_STANDALONE_C;
+    int32_t ret = UbsioKvCachePrepareConfig(nullptr, &mode);
+    if (ret != UBSIO_KVC_OK) return ret;
+    ret = KvcInstance::Instance().Initialize(devId);
     if (UNLIKELY(ret != UBSIO_KVC_OK)) {
         LOG_ERROR("init kvc instance failed, device id: " << devId << ", ret: " << ret);
         return UBSIO_KVC_ERR;
@@ -129,6 +141,7 @@ UBSIO_API int32_t UbsioKvCacheBatchPut(const char **keys,
         LOG_ERROR("Invalid params, keysCount: " << keysCount); 
         return UBSIO_KVC_INVALID_PARAM; 
     } 
+    std::fill_n(results, keysCount, UBSIO_KVC_ERR);
     std::vector<std::string> key_vector; 
     std::vector<void *> bufs_vector; 
     std::vector<int> batchResult(keysCount, UBSIO_KVC_ERR); 
@@ -158,12 +171,11 @@ UBSIO_API int32_t UbsioKvCacheBatchPut(const char **keys,
     auto ret = KvcBatchPutData(key_vector, bufs_vector, lengths_vector, batchResult, flags); 
     if (ret != UBSIO_KVC_OK) { 
         LOG_ERROR("batch put failed, keysCount: " << keysCount); 
-        return UBSIO_KVC_ERR; 
     } 
     for (uint32_t i = 0; i < keysCount; ++i) { 
-        results[i] = batchResult[i]; 
+        results[i] = batchResult[i] == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
     } 
-    return UBSIO_KVC_OK; 
+    return ret == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
 }
 
 UBSIO_API int32_t UbsioKvCacheGet(const char *key, void *buf, size_t length, uint32_t flags) 
@@ -207,6 +219,7 @@ UBSIO_API int32_t UbsioKvCacheBatchDelete(const char **keys, uint32_t keysCount,
         LOG_ERROR("Invalid parma"); 
         return UBSIO_KVC_INVALID_PARAM; 
     } 
+    std::fill_n(results, keysCount, UBSIO_KVC_ERR);
     std::vector<std::string> key_vector; 
     std::vector<int> delete_results_vector(keysCount, UBSIO_KVC_ERR); 
     key_vector.reserve(keysCount); 
@@ -226,12 +239,11 @@ UBSIO_API int32_t UbsioKvCacheBatchDelete(const char **keys, uint32_t keysCount,
     auto ret = KvcBatchDeleteKey(key_vector, delete_results_vector, flags); 
     if (ret != UBSIO_KVC_OK) { 
         LOG_ERROR("Kvc batch delete failed"); 
-        return UBSIO_KVC_ERR; 
     } 
     for (uint32_t i = 0; i < keysCount; ++i) { 
-        results[i] = delete_results_vector[i]; 
+        results[i] = delete_results_vector[i] == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
     } 
-    return UBSIO_KVC_OK; 
+    return ret == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
 }
 
 UBSIO_API int32_t UbsioKvCacheGetLength(const char *key, size_t *length, uint32_t flags) 
@@ -264,11 +276,13 @@ UBSIO_API int32_t UbsioKvCacheBatchGetLength(const char **keys,
         LOG_ERROR("Invalid params, keysCount: " << keysCount); 
         return UBSIO_KVC_INVALID_PARAM; 
     } 
+    std::fill_n(results, keysCount, UBSIO_KVC_ERR);
+    std::fill_n(lengths, keysCount, 0);
     std::vector<std::string> key_vector; 
     std::vector<int> length_results_vector(keysCount, UBSIO_KVC_ERR); 
     std::vector<uint32_t> get_lengths; 
     key_vector.reserve(keysCount); 
-    get_lengths.reserve(keysCount); 
+    get_lengths.resize(keysCount);
 
 
     for (size_t i = 0; i < keysCount; i++) { 
@@ -286,13 +300,12 @@ UBSIO_API int32_t UbsioKvCacheBatchGetLength(const char **keys,
     auto ret = KvcBatchGetLengthKey(key_vector, get_lengths, length_results_vector, flags); 
     if (ret != UBSIO_KVC_OK) { 
         LOG_ERROR("Kvc batch get length failed"); 
-        return UBSIO_KVC_ERR; 
     } 
     for (uint32_t i = 0; i < keysCount; ++i) { 
         lengths[i] = static_cast<size_t>(get_lengths[i]); 
-        results[i] = length_results_vector[i]; 
+        results[i] = length_results_vector[i] == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
     } 
-    return UBSIO_KVC_OK; 
+    return ret == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
 }
 
 UBSIO_API int32_t UbsioKvCacheBatchGet(const char **keys,
@@ -311,6 +324,7 @@ UBSIO_API int32_t UbsioKvCacheBatchGet(const char **keys,
         return UBSIO_KVC_INVALID_PARAM;
     }
 
+    std::fill_n(results, keysCount, UBSIO_KVC_ERR);
     std::vector<std::string> keyVector(keysCount);
     std::vector<int> batchResult(keysCount, UBSIO_KVC_ERR);
     std::vector<size_t> lengthsVector(keysCount);
@@ -334,12 +348,11 @@ UBSIO_API int32_t UbsioKvCacheBatchGet(const char **keys,
     auto ret = KvcBatchGetData(keyVector, bufs, lengthsVector, batchResult, flags);
     if (UNLIKELY(ret != UBSIO_KVC_OK)) {
         LOG_ERROR("Kvc batch get failed, ret:" << ret);
-        return UBSIO_KVC_ERR;
     }
     for (uint32_t i = 0; i < keysCount; ++i) {
-        results[i] = batchResult[i];
+        results[i] = batchResult[i] == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
     }
-    return UBSIO_KVC_OK;
+    return ret == UBSIO_KVC_OK ? UBSIO_KVC_OK : UBSIO_KVC_ERR;
 }
 
 int32_t UbsioKvCacheBatchGetDirect(const char **keys,
@@ -367,6 +380,7 @@ UBSIO_API int32_t UbsioKvCacheBatchExist(const char **keys, uint32_t keysCount, 
         return UBSIO_KVC_INVALID_PARAM;
     }
 
+    std::fill_n(results, keysCount, false);
     std::vector<std::string> keyVector(keysCount);
     for (size_t i = 0; i < keysCount; i++) {
         if (UNLIKELY(keys[i] == nullptr)) {

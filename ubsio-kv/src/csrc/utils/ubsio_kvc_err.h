@@ -27,7 +27,12 @@ enum KvcError : int32_t {
     UBSIO_KVC_EAGAIN = 5,
     UBSIO_KVC_BIO_ERR = 6,
     UBSIO_KVC_NO_NDS = 7,
-    UBSIO_KVC_MAX = 8,
+    // Retained for the remote object layer's missing/corrupt/retry decisions.
+    // Public batch APIs report only success/failure; keep assigned values stable.
+    UBSIO_KVC_NOT_FOUND = 8,
+    UBSIO_KVC_CORRUPT = 9,
+    UBSIO_KVC_UNAVAILABLE = 10,
+    UBSIO_KVC_MAX = 11,
 };
 
 }

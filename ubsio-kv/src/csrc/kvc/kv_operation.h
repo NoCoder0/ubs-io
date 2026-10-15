@@ -14,6 +14,7 @@
 #define KVC_OPERATION_H
 
 #include <vector>
+#include <condition_variable>
 #include "ubsio_kvc_def.h"
 #include "ubsio_kvc_log.h"
 #include "ubsio_kvc_execution.h"
@@ -65,6 +66,7 @@ public:
     int32_t BatchGetLengthKey(const std::vector<std::string> &key, std::vector<uint32_t> &lengths, std::vector<int> &results);    
     inline int32_t InitKvExecutor(void)
     {
+        std::lock_guard<std::mutex> guard(mBatchMutex);
         if (mKvExecutor != nullptr) {
             return UBSIO_KVC_OK;
         }
@@ -73,9 +75,11 @@ public:
             LOG_ERROR("Failed to create execution service for get kv, probably out of memory");
             return UBSIO_KVC_ERR;
         }
+        mReadExecutorClosing = false;
         auto result = mKvExecutor->Start();
         if (!result) {
             LOG_ERROR("Failed to start execution service for get kv, probably out of memory");
+            mKvExecutor = nullptr;
             return UBSIO_KVC_ERR;
         }
         return UBSIO_KVC_OK;
@@ -83,6 +87,9 @@ public:
 
     inline void ExitKvExecutor(void)
     {
+        std::unique_lock<std::mutex> guard(mBatchMutex);
+        mReadExecutorClosing = true;
+        mReadBatchesDone.wait(guard, [this] { return mActiveReadBatches == 0; });
         if (mKvExecutor != nullptr) {
             mKvExecutor->Stop();
             mKvExecutor = nullptr;
@@ -91,12 +98,16 @@ public:
 
 private:
     KvOperation() = default;
+    int32_t RunRemoteReads(size_t count, std::vector<int> &results, const std::function<int32_t(size_t)> &task);
 
 private:
     int mSharedFd{ -1 };
     std::mutex mMutex;
+    std::mutex mBatchMutex;
+    std::condition_variable mReadBatchesDone;
+    size_t mActiveReadBatches{0};
+    bool mReadExecutorClosing{false};
     bool mInited{ false };
-    uint64_t tenantId{ 1 };
     ExecutorServicePtr mKvExecutor{ nullptr };
     static std::mutex gLock;
     static KvOperation *gInstance;

@@ -19,6 +19,7 @@
 #include "ubsio_kvc_instance.h"
 #include "kv_operation.h"
 #include "ubsio_kvc_operation.h"
+#include "remote_dram_object.h"
 
 namespace ock {
 namespace ubsio {
@@ -70,6 +71,7 @@ void KvcExit(void)
     if (g_kvOperation != nullptr) {
         g_kvOperation->ExitKvExecutor();
     }
+    remote_dram::ResetDirectory();
     KvcInstance::Instance().UnInitialize();
     KvcStreamManager::DestroyAclStream();
     DlBioSdkApi::Exit();
@@ -139,7 +141,8 @@ int32_t KvcBatchGetLengthKey(const std::vector<std::string> &key,
 
 int32_t KvcBatchFreeGetAddress(void **bufs, uint32_t keys_count)
 {
-    return DlBioSdkApi::BatchGetFree(tenantId, reinterpret_cast<uintptr_t*>(bufs), keys_count);
+    if (DlBioSdkApi::RemoteMode()) return UBSIO_KVC_OK; // Remote BatchGet never replaces caller buffers.
+    return DlBioSdkApi::BatchGetFree(DlBioSdkApi::TenantId(), reinterpret_cast<uintptr_t*>(bufs), keys_count);
 }
 
 } // namespace ubsio

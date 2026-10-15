@@ -15,6 +15,7 @@
 
 #include "bio_config.h"
 #include "bio_err.h"
+#include "bio_kvc_config_values.h"
 
 namespace ock {
 namespace bio {

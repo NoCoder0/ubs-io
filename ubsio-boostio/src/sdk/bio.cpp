@@ -12,6 +12,8 @@
 
 #include <iostream>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include "securec.h"
 #include "message.h"
 #include "bio_functions.h"
@@ -20,6 +22,7 @@
 #include "bio_trace.h"
 #include "bio_client.h"
 #include "bio.h"
+#include "bio_kvc_config.h"
 
 namespace ock {
 namespace bio {
@@ -697,18 +700,36 @@ static bool CheckClientConfig(const ClientOptionsConfig &optConf)
     return true;
 }
 
+CResult BioLoadKvcConfig(const char *path, uint32_t size, BioKvcConfigV1 *out, ClientOptionsConfig *tlsOptions)
+{
+    try {
+        return LoadBioKvcConfig(path, size, out, tlsOptions);
+    } catch (...) {
+        std::fputs("KVC startup configuration failed: internal error\n", stderr);
+        return RET_CACHE_ERROR;
+    }
+}
+
 CResult BioInitialize(WorkerMode mode, ClientOptionsConfig *optConf)
 {
+    const auto kvcConfig = GetBioKvcSnapshot();
+    if (kvcConfig && mode == STANDALONE && setenv("UBSIO_CONFIG_PATH", kvcConfig->path.c_str(), 1) != 0) {
+        return RET_CACHE_ERROR;
+    }
     if (optConf == nullptr) {
         ClientOptionsConfig config{};
         config.enable = false;
-        return BioService::Initialize(mode, config);
+        const CResult result = BioService::Initialize(mode, config);
+        if (result == RET_CACHE_OK) LogBioKvcConfigReady();
+        return result;
     }
 
     if (!CheckClientConfig(*optConf)) {
         return RET_CACHE_EPERM;
     }
-    return BioService::Initialize(mode, *optConf);
+    const CResult result = BioService::Initialize(mode, *optConf);
+    if (result == RET_CACHE_OK) LogBioKvcConfigReady();
+    return result;
 }
 
 CResult BioRegisterMetaEventCallback(UbsioMetaEventCallbackC callback, void *context)

@@ -194,6 +194,26 @@ typedef struct {
     char opensslLibDir[PATH_MAX];      // openssl lib dir path
 } ClientOptionsConfig;
 
+#define BIO_KVC_CONFIG_VERSION_1 (1U)
+#define BIO_KVC_MODE_STANDALONE (0U)
+#define BIO_KVC_MODE_REMOTE_DRAM_TCP (1U)
+
+typedef struct {
+    uint32_t version;
+    uint32_t mode;
+    uint64_t tenantId;
+    uint32_t readWorkers;
+    uint32_t manifestOneGet;
+} BioKvcConfigV1;
+
+/** Prepare one immutable startup snapshot without starting networking or a cache.
+ * out->version must be BIO_KVC_CONFIG_VERSION_1 and size must equal sizeof(*out).
+ * path is absolute; NULL/empty selects UBSIO_CONFIG_PATH, then /etc/ubsio/ubsio.conf.
+ * Repeating the prepared path returns the snapshot; a different path fails.
+ * Only TLS fields in tlsOptions are updated; caller logging options are preserved.
+ */
+CResult BioLoadKvcConfig(const char *path, uint32_t size, BioKvcConfigV1 *out, ClientOptionsConfig *tlsOptions);
+
 /**
  * @brief: Initialize boostio service
  *

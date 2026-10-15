@@ -138,7 +138,11 @@ public:
         }
 
         tmp->IncreaseRef();
-        return mRunnableQueue.Enqueue(tmp);
+        if (mRunnableQueue.Enqueue(tmp)) {
+            return true;
+        }
+        tmp->DecreaseRef();
+        return false;
     }
 
     /*
