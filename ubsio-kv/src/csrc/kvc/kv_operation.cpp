@@ -18,6 +18,7 @@
 #include <memory>
 #include <condition_variable>
 #include <limits>
+#include <atomic>
 #include "bio_c.h"
 #include "bio_err.h"
 #include "ubsio_kvc_log.h"
@@ -25,6 +26,7 @@
 #include "dl_biosdk_api.h"
 #include "kv_operation.h"
 #include "remote_dram_object.h"
+#include "remote_tuning.h"
 
 namespace ock {
 namespace ubsio {
@@ -32,6 +34,7 @@ namespace ubsio {
 KvOperation *KvOperation::gInstance = nullptr;
 std::mutex KvOperation::gLock;
 constexpr uint32_t BATCH_LIMIT = 1000;
+constexpr size_t REMOTE_GET_WORKERS = 2;
 
 namespace {
 int32_t MapBioResult(CResult result)
@@ -185,10 +188,9 @@ int32_t KvOperation::BatchKvGetData(const std::vector<std::string> &key, void **
         if (bufs == nullptr || lengths.size() != key.size() || results.size() < key.size()) {
             return UBSIO_KVC_INVALID_PARAM;
         }
-        for (size_t i = 0; i < key.size(); ++i) {
-            results[i] = remote_dram::BatchGet(key[i], bufs[i], lengths[i]);
-        }
-        return UBSIO_KVC_OK;
+        return RunRemoteReads(key.size(), results, [&](size_t index) {
+            return remote_dram::BatchGet(key[index], bufs[index], lengths[index]);
+        });
     }
     uint32_t keysCount = key.size();
     std::vector<ObjLocation> locationVec(keysCount);
@@ -248,6 +250,80 @@ int32_t KvOperation::BatchKvExistKey(const std::vector<std::string> &key, bool *
         return UBSIO_KVC_ERR;
     }
     return UBSIO_KVC_OK;
+}
+
+int32_t KvOperation::RunRemoteReads(size_t count, std::vector<int> &results,
+                                    const std::function<int32_t(size_t)> &task)
+{
+    if (results.size() < count) return UBSIO_KVC_INVALID_PARAM;
+    std::fill_n(results.begin(), count, UBSIO_KVC_UNAVAILABLE);
+    if (count == 0) return UBSIO_KVC_OK;
+    ExecutorServicePtr executor;
+    {
+        std::lock_guard<std::mutex> guard(mBatchMutex);
+        if (mKvExecutor == nullptr || mReadExecutorClosing) return UBSIO_KVC_UNAVAILABLE;
+        executor = mKvExecutor;
+        ++mActiveReadBatches;
+    }
+    // Keep the executor alive and forbid Stop (which prepends stop tasks) until
+    // every accepted worker completes. Do not hold the common batch mutex here.
+    struct ReadLease {
+        KvOperation &operation;
+        ~ReadLease()
+        {
+            std::lock_guard<std::mutex> guard(operation.mBatchMutex);
+            --operation.mActiveReadBatches;
+            operation.mReadBatchesDone.notify_all();
+        }
+    } lease{*this};
+    std::atomic<size_t> next{0};
+    std::atomic<bool> abort{false};
+    std::mutex mutex;
+    std::condition_variable completed;
+    size_t pending = 0;
+    bool submitFailed = false;
+    RemoteTuning tuning;
+    if (!ReadRemoteTuning(tuning, REMOTE_GET_WORKERS)) return UBSIO_KVC_INVALID_PARAM;
+    const size_t workers = std::min<size_t>(tuning.workers, count);
+    LOG_INFO("Sweep remote object workers:" << workers << " count:" << count);
+    for (size_t worker = 0; worker < workers; ++worker) {
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            ++pending;
+        }
+        bool accepted = false;
+        try {
+            accepted = executor->Execute([&]() {
+                while (!abort.load()) {
+                    const size_t index = next.fetch_add(1);
+                    if (index >= count) break;
+                    try {
+                        results[index] = task(index);
+                    } catch (...) {
+                        LOG_ERROR("Remote read task threw, index:" << index);
+                        results[index] = UBSIO_KVC_ERR;
+                    }
+                }
+                std::lock_guard<std::mutex> guard(mutex);
+                --pending;
+                // Notify while holding the completion mutex: the waiter must
+                // not destroy this condition variable before the final notify.
+                completed.notify_all();
+            });
+        } catch (...) {
+            LOG_ERROR("Remote read worker submission threw");
+        }
+        if (!accepted) {
+            abort.store(true);
+            std::lock_guard<std::mutex> guard(mutex);
+            --pending;
+            submitFailed = true;
+            break;
+        }
+    }
+    std::unique_lock<std::mutex> guard(mutex);
+    completed.wait(guard, [&pending] { return pending == 0; });
+    return submitFailed ? UBSIO_KVC_UNAVAILABLE : UBSIO_KVC_OK;
 }
 
 int32_t KvOperation::RunBatch(size_t count, std::vector<int> &results,

@@ -3,6 +3,8 @@
  * ubs-io is licensed under the Mulan PSL v2.
  */
 #include "remote_dram_object.h"
+#include "remote_tuning.h"
+#include "remote_read_limits.h"
 
 #include <array>
 #include <algorithm>
@@ -40,6 +42,7 @@ constexpr uint32_t MANIFEST_VERSION = 1;
 constexpr size_t KEY_LOCK_COUNT = 256;
 constexpr size_t MAX_KEYS_PER_SHARD = 4096; // At most 1M logical directory entries per SDK.
 constexpr uint32_t BATCH_GET_WIDTH = 16;
+static_assert(BATCH_GET_WIDTH <= READ_BLOCK_LIMIT, "Window exceeds SDK read budget");
 std::array<std::mutex, KEY_LOCK_COUNT> keyLocks;
 std::atomic<uint64_t> generationCounter{1};
 
@@ -269,6 +272,22 @@ bool Valid(const Manifest &manifest, const std::string &key)
     return manifest.chunkCount == (manifest.length + CHUNK_BYTES - 1) / CHUNK_BYTES;
 }
 
+int32_t ReadManifest(const std::string &key, Manifest &manifest)
+{
+    ObjLocation location{};
+    int32_t result = Location(key, location);
+    if (result != UBSIO_KVC_OK) return result;
+    // Request one extra byte to reject oversized manifests while accepting SDK short reads.
+    std::array<char, sizeof(Manifest) + 1> bytes{};
+    uint64_t actual = 0;
+    result = MapBio(DlBioSdkApi::Get(DlBioSdkApi::TenantId(), key.c_str(), 0, bytes.size(), location,
+                                    bytes.data(), &actual));
+    if (result != UBSIO_KVC_OK) return result;
+    if (actual != sizeof(Manifest)) return UBSIO_KVC_CORRUPT;
+    std::memcpy(&manifest, bytes.data(), sizeof(manifest));
+    return UBSIO_KVC_OK;
+}
+
 int32_t LoadManifest(const std::string &key, Manifest &manifest)
 {
     const auto &directory = committed[HashKey(key) % KEY_LOCK_COUNT];
@@ -276,11 +295,18 @@ int32_t LoadManifest(const std::string &key, Manifest &manifest)
     if (entry == directory.end()) return UBSIO_KVC_NOT_FOUND;
     const auto expected = entry->second;
     const auto physicalKey = ManifestKey(expected);
-    uint32_t size = 0;
-    int32_t result = Stat(physicalKey, size);
-    if (result != UBSIO_KVC_OK) return result;
-    if (size != sizeof(manifest)) return UBSIO_KVC_CORRUPT;
-    result = Read(physicalKey, &manifest, sizeof(manifest));
+    RemoteTuning tuning;
+    if (!ReadRemoteTuning(tuning)) return UBSIO_KVC_INVALID_PARAM;
+    int32_t result = UBSIO_KVC_OK;
+    if (tuning.manifestOneGet) {
+        result = ReadManifest(physicalKey, manifest);
+    } else {
+        uint32_t size = 0;
+        result = Stat(physicalKey, size);
+        if (result != UBSIO_KVC_OK) return result;
+        if (size != sizeof(manifest)) return UBSIO_KVC_CORRUPT;
+        result = Read(physicalKey, &manifest, sizeof(manifest));
+    }
     if (result != UBSIO_KVC_OK) return result;
     return Valid(manifest, key) && std::memcmp(&manifest, &expected, sizeof(manifest)) == 0 ?
         UBSIO_KVC_OK : UBSIO_KVC_CORRUPT;
@@ -422,6 +448,10 @@ int32_t BatchGet(const std::string &key, void *value, size_t capacity)
             if (result != UBSIO_KVC_OK) return result;
         }
 
+        // Reserve the entire window before any SDK allocation. The buffer guard
+        // below is destroyed first, so credits return only after buffers are freed.
+        ReadWindowCredits credits(count);
+        if (!credits.Valid()) return UBSIO_KVC_INVALID_PARAM;
         const CResult batchResult = DlBioSdkApi::BatchGet(DlBioSdkApi::TenantId(), keys.data(), count,
             offsets.data(), lengths.data(), locations.data(), addresses.data(), realLengths.data(),
             itemResults.data());

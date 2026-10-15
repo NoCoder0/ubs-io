@@ -13,7 +13,7 @@ namespace ock {
 namespace ubsio {
 namespace remote_dram {
 
-constexpr uint32_t CHUNK_BYTES = 1024U * 1024U;
+constexpr uint32_t CHUNK_BYTES = 1U * 1024U * 1024U;
 int32_t Put(const std::string &key, const void *value, size_t length);
 int32_t Get(const std::string &key, void *value, size_t capacity);
 int32_t BatchGet(const std::string &key, void *value, size_t capacity);

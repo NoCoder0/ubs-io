@@ -1,0 +1,48 @@
+GLM-5.2 D-group remote DRAM source baseline
+
+Provenance
+The base revision is 74290e45653f0172ce78c21e410edb4f05c08697.
+The UBSIO-KV overlay is the source/parallel2/ubsio-kv snapshot from
+glm52_warmABC_screen96_20261013_2215_screen1, used by group D in
+glm52_native90_acdef_20261015_run1_D. The historical ARM library SHA256 is
+ebde2706e436089156f14fc07d5ed5f47971e7e9f68a542fcde4d8edc4cf76d7.
+This records the source lineage; a new build need not be byte-identical.
+
+Configuration
+UBSIO_KVC_REMOTE_IPS accepts distinct, comma-separated IPv4 addresses.
+Every configured host must be present with healthy, nonlocal, single-copy
+partitions. The daemon and SDK accept network timeouts up to 300 seconds.
+
+Set UBSIO_KVC_TUNING_FILE to a readable file containing two integers:
+    4 0
+The first selects object read workers (2 or 4); the second selects the
+optional single-Get manifest path (0 or 1). D uses 4 workers and 0.
+Without this environment variable, defaults are 2 workers and 0.
+Malformed contents or an unreadable configured file return an invalid-
+parameter error. Keep the file stable during requests; publish changes
+atomically between phases. The experimental reader opens it on read paths.
+
+Logical chunks remain 1 MiB, with 16 chunks per SDK BatchGet window.
+All remote reads in a process share 64 SDK buffer credits. At the tested
+SDK allocation size of 4 MiB per buffer, the limit is 256 MiB per process,
+not per worker, machine, or deployment. Credits return after buffers free.
+Accepted worker tasks finish before the batch returns or executor stops.
+Per-object failures remain in the results array. CRC and length checks
+remain enabled. The later 8-worker D1 variant is not included here.
+
+Validation scope
+The imported snapshot was verified against its 55-entry build manifest.
+Historical ARM build/integrity evidence belongs to the experiment above.
+Local import checks use git diff --check and existing standalone C++ tests.
+The parallel behavior fixtures contain copied scheduler logic; they are
+not a substitute for compiling the full production library or integration
+testing on ARM. No inference benchmark is rerun by this local import.
+
+Standalone fixture compilation (from repository root, output outside it):
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
+    -Iubsio-kv/src/csrc/kvc -Iubsio-kv/src/csrc/utils \
+    ubsio-kv/test/<fixture>.cpp -o <output>
+Fixtures: remote_parallel_read_behavior_test, remote_read_credits_test,
+sweep_parallel_p2_test, sweep_parallel_p4_test.
+For the sweep fixtures, set UBSIO_KVC_TUNING_FILE to a temporary file
+containing respectively "2 0" and "4 0", then run the resulting binary.
