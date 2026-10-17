@@ -12,8 +12,8 @@ namespace ock {
 namespace ubsio {
 namespace remote_dram {
 // One DlBioSdkApi singleton and SDK data-message pool per process. All remote
-// BatchGet callers share this budget; a slot costs one actual 4 MiB SDK block.
-constexpr size_t READ_BLOCK_LIMIT = 64;
+// BatchGet callers share this budget; a slot costs one actual SDK data-message block.
+// Every caller uses the same immutable limit loaded at process startup.
 struct ReadBlockBudget {
     std::mutex mutex;
     std::condition_variable available;
@@ -26,12 +26,12 @@ inline ReadBlockBudget &SdkReadBlockBudget()
 }
 class ReadWindowCredits {
 public:
-    explicit ReadWindowCredits(size_t blocks) : blocks_(blocks), valid_(blocks <= READ_BLOCK_LIMIT)
+    ReadWindowCredits(size_t blocks, size_t blockLimit) : blocks_(blocks), valid_(blocks > 0 && blocks <= blockLimit)
     {
         if (!valid_) return;
         auto &budget = SdkReadBlockBudget();
         std::unique_lock<std::mutex> guard(budget.mutex);
-        budget.available.wait(guard, [&budget, blocks] { return budget.used <= READ_BLOCK_LIMIT - blocks; });
+        budget.available.wait(guard, [&budget, blocks, blockLimit] { return budget.used <= blockLimit - blocks; });
         budget.used += blocks;
     }
     ~ReadWindowCredits()

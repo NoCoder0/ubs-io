@@ -67,7 +67,8 @@ bool Parse(KVReader &reader, BioKvcSnapshot &snapshot)
         Item(reader, KVC_TENANT_ID.first, KVC_TENANT_ID.second),
         Item(reader, KVC_REMOTE_IPS.first, KVC_REMOTE_IPS.second),
         Item(reader, KVC_READ_WORKERS.first, KVC_READ_WORKERS.second),
-        Item(reader, KVC_MANIFEST_ONE_GET.first, KVC_MANIFEST_ONE_GET.second), snapshot.values, error)) {
+        Item(reader, KVC_MANIFEST_ONE_GET.first, KVC_MANIFEST_ONE_GET.second),
+        Item(reader, KVC_READ_BLOCK_LIMIT.first, KVC_READ_BLOCK_LIMIT.second), snapshot.values, error)) {
         return Invalid(error, "invalid value or inconsistent mode/tenant/IP list");
     }
     const auto protocol = Item(reader, NET_DATA_PROTOCOL.first, NET_DATA_PROTOCOL.second);
@@ -177,7 +178,8 @@ void LogBioKvcConfigReady()
     CLIENT_LOG_INFO("KVC startup configuration path:" << snapshot->path << ", mode:"
         << (snapshot->values.remote ? "remote_dram_tcp" : "standalone") << ", tenant:"
         << snapshot->values.tenantId << ", nodes:" << snapshot->values.remoteIps.size() << ", workers:"
-        << snapshot->values.readWorkers << ", manifestOneGet:" << snapshot->values.manifestOneGet);
+        << snapshot->values.readWorkers << ", readBlockLimit:" << snapshot->values.readBlockLimit
+        << ", manifestOneGet:" << snapshot->values.manifestOneGet);
 }
 }
 }

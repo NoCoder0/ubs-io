@@ -32,7 +32,8 @@ void BioConfig::LoadDefaultConf()
     AddStrConf(KVC_MODE, VStrEnum::Create(KVC_MODE.first, "standalone||remote_dram_tcp"));
     AddStrConf(KVC_TENANT_ID);
     AddStrConf(KVC_REMOTE_IPS);
-    AddStrConf(KVC_READ_WORKERS, VStrEnum::Create(KVC_READ_WORKERS.first, "2||4"));
+    AddStrConf(KVC_READ_WORKERS);
+    AddStrConf(KVC_READ_BLOCK_LIMIT);
     AddStrConf(KVC_MANIFEST_ONE_GET, VStrEnum::Create(KVC_MANIFEST_ONE_GET.first, "true||false"));
     /* load net config for fs */
     AddStrConf(NET_DATA_PROTOCOL, VStrEnum::Create(NET_DATA_PROTOCOL.first, "tcp||rdma"));
@@ -129,7 +130,7 @@ BResult BioConfig::AutoConfAfterLoadFromFile(const ConfigurationPtr &conf)
     std::string error;
     if (!ParseKvcValues(conf->GetStr(KVC_MODE.first), conf->GetStr(KVC_TENANT_ID.first),
         conf->GetStr(KVC_REMOTE_IPS.first), conf->GetStr(KVC_READ_WORKERS.first),
-        conf->GetStr(KVC_MANIFEST_ONE_GET.first), kvc, error)) {
+        conf->GetStr(KVC_MANIFEST_ONE_GET.first), conf->GetStr(KVC_READ_BLOCK_LIMIT.first), kvc, error)) {
         LOG_ERROR("Invalid KVC configuration, key:" << error);
         return BIO_INVALID_PARAM;
     }

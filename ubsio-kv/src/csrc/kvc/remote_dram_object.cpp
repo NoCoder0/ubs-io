@@ -41,7 +41,6 @@ constexpr uint32_t MANIFEST_VERSION = 1;
 constexpr size_t KEY_LOCK_COUNT = 256;
 constexpr size_t MAX_KEYS_PER_SHARD = 4096; // At most 1M logical directory entries per SDK.
 constexpr uint32_t BATCH_GET_WIDTH = 16;
-static_assert(BATCH_GET_WIDTH <= READ_BLOCK_LIMIT, "Window exceeds SDK read budget");
 std::array<std::mutex, KEY_LOCK_COUNT> keyLocks;
 std::atomic<uint64_t> generationCounter{1};
 
@@ -447,7 +446,7 @@ int32_t BatchGet(const std::string &key, void *value, size_t capacity)
 
         // Reserve the entire window before any SDK allocation. The buffer guard
         // below is destroyed first, so credits return only after buffers are freed.
-        ReadWindowCredits credits(count);
+        ReadWindowCredits credits(count, DlBioSdkApi::ReadBlockLimit());
         if (!credits.Valid()) return UBSIO_KVC_INVALID_PARAM;
         const CResult batchResult = DlBioSdkApi::BatchGet(DlBioSdkApi::TenantId(), keys.data(), count,
             offsets.data(), lengths.data(), locations.data(), addresses.data(), realLengths.data(),

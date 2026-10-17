@@ -25,18 +25,27 @@ const auto KVC_MODE = std::make_pair("ubsio.kvc.mode", "standalone");
 const auto KVC_TENANT_ID = std::make_pair("ubsio.kvc.tenant_id", "1");
 const auto KVC_REMOTE_IPS = std::make_pair("ubsio.kvc.remote_ips", "");
 const auto KVC_READ_WORKERS = std::make_pair("ubsio.kvc.read_workers", "2");
+const auto KVC_READ_BLOCK_LIMIT = std::make_pair("ubsio.kvc.read_block_limit", "64");
 const auto KVC_MANIFEST_ONE_GET = std::make_pair("ubsio.kvc.manifest_one_get", "false");
 constexpr uint32_t KVC_DEFAULT_WORKERS = 2;
-constexpr uint32_t KVC_D_WORKERS = 4;
+constexpr uint32_t KVC_MAX_READ_WORKERS = 16;
+constexpr uint32_t KVC_DEFAULT_READ_BLOCK_LIMIT = 64;
+constexpr uint32_t KVC_MIN_READ_BLOCK_LIMIT = 16;
 constexpr uint64_t KVC_STANDALONE_TENANT = 1;
 
 struct KvcConfigValues {
     bool remote = false;
     uint64_t tenantId = KVC_STANDALONE_TENANT;
     uint32_t readWorkers = KVC_DEFAULT_WORKERS;
+    uint32_t readBlockLimit = KVC_DEFAULT_READ_BLOCK_LIMIT;
     bool manifestOneGet = false;
     std::set<std::string> remoteIps;
 };
+
+inline bool KvcReadBudgetFitsPool(uint32_t blockLimit, uint64_t poolBytes, uint64_t blockBytes)
+{
+    return blockLimit > 0 && blockBytes > 0 && blockLimit <= poolBytes / blockBytes;
+}
 
 inline bool ParseKvcUint64(const std::string &text, uint64_t &out)
 {
@@ -72,8 +81,11 @@ inline bool ParseKvcIps(const std::string &list, std::set<std::string> &out)
 }
 
 inline bool ParseKvcValues(const std::string &mode, const std::string &tenant, const std::string &ips,
-    const std::string &workers, const std::string &manifest, KvcConfigValues &out, std::string &error)
+    const std::string &workers, const std::string &manifest, const std::string &readBlockLimit,
+    KvcConfigValues &out, std::string &error)
 {
+    uint64_t parsedWorkers = 0;
+    uint64_t parsedBlockLimit = 0;
     if (mode != "standalone" && mode != "remote_dram_tcp") {
         error = KVC_MODE.first;
     } else if (!ParseKvcUint64(tenant, out.tenantId) ||
@@ -81,13 +93,18 @@ inline bool ParseKvcValues(const std::string &mode, const std::string &tenant, c
         error = KVC_TENANT_ID.first;
     } else if (!ParseKvcIps(ips, out.remoteIps) || (mode == "remote_dram_tcp" && out.remoteIps.empty())) {
         error = KVC_REMOTE_IPS.first;
-    } else if (workers != "2" && workers != "4") {
+    } else if (!ParseKvcUint64(workers, parsedWorkers) || parsedWorkers == 0 ||
+        parsedWorkers > KVC_MAX_READ_WORKERS) {
         error = KVC_READ_WORKERS.first;
+    } else if (!ParseKvcUint64(readBlockLimit, parsedBlockLimit) || parsedBlockLimit < KVC_MIN_READ_BLOCK_LIMIT ||
+        parsedBlockLimit > std::numeric_limits<uint32_t>::max()) {
+        error = KVC_READ_BLOCK_LIMIT.first;
     } else if (manifest != "true" && manifest != "false") {
         error = KVC_MANIFEST_ONE_GET.first;
     } else {
         out.remote = mode == "remote_dram_tcp";
-        out.readWorkers = workers == "4" ? KVC_D_WORKERS : KVC_DEFAULT_WORKERS;
+        out.readWorkers = static_cast<uint32_t>(parsedWorkers);
+        out.readBlockLimit = static_cast<uint32_t>(parsedBlockLimit);
         out.manifestOneGet = manifest == "true";
         return true;
     }

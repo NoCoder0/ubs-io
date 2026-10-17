@@ -48,6 +48,7 @@ namespace ubsio {
 class DlBioSdkApi {
 public:
     static uint64_t TenantId() { return 17; }
+    static uint32_t ReadBlockLimit() { return 64; }
     static bool ManifestOneGet() { return mockManifestOneGet; }
     static bool mockManifestOneGet;
     static CResult CalcLocation(uint64_t, uint64_t, ObjLocation *) { return RET_CACHE_OK; }

@@ -12,6 +12,7 @@
 
 #include <mockcpp/mockcpp.hpp>
 #include <algorithm>
+#include <cstring>
 #include "gtest/gtest.h"
 #include "message.h"
 #include "bio_server.h"
@@ -1047,6 +1048,66 @@ TEST_F(TestBioServer, test_bio_server_writer)
     isAlloc = false;
     ret = mirror->WriterRemote(isAlloc, lMrVec, rMrVec1, netCtx, req);
     EXPECT_EQ(ret, BIO_NET_RETRY);
+}
+
+TEST_F(TestBioServer, test_bio_server_writer_actual_length)
+{
+    MirrorServerPtr mirror = BioServer::Instance()->GetMirrorServer();
+    constexpr uint32_t chunkSize = 1024 * 1024;
+    constexpr uint32_t mrCapacity = 4 * chunkSize;
+    struct ReadCase {
+        uint32_t actual;
+        uint32_t requested;
+    };
+    for (const auto &test : {ReadCase{48, 48}, ReadCase{48, 49}, ReadCase{49, 49},
+        ReadCase{chunkSize, chunkSize}, ReadCase{chunkSize + 37, chunkSize + 37},
+        ReadCase{mrCapacity, mrCapacity}}) {
+        std::vector<char> data(test.actual);
+        for (size_t index = 0; index < data.size(); ++index) data[index] = static_cast<char>(index % 251);
+        const auto address = reinterpret_cast<uintptr_t>(data.data());
+        const uint32_t firstLength = test.actual / 2;
+        std::vector<FlowAddr> fromAddrs{FlowAddr(address, 0, firstLength),
+            FlowAddr(address, firstLength, test.actual - firstLength)};
+        MrInfo target{1, mrCapacity};
+        std::vector<FlowAddr> toAddrs{FlowAddr(target)};
+        WCacheSlicePtr from = MakeRef<WCacheSlice>(1, 0, 0, test.actual, fromAddrs);
+        RCacheSlicePtr to = MakeRef<RCacheSlice>(1, test.requested, toAddrs);
+        std::vector<NetMrInfo> remoteMrs;
+        std::vector<NetMrInfo> localMrs;
+        bool isAlloc = false;
+        ASSERT_EQ(mirror->WriterParseMrInfo(from.Get(), to.Get(), remoteMrs, localMrs, 1, isAlloc), BIO_OK);
+        EXPECT_TRUE(isAlloc);
+        EXPECT_EQ(localMrs.size(), 1U);
+        if (!localMrs.empty()) {
+            EXPECT_EQ(localMrs[0].size, test.actual);
+            EXPECT_EQ(std::memcmp(reinterpret_cast<const void *>(localMrs[0].address),
+                data.data(), data.size()), 0);
+        }
+        for (const auto &mr : localMrs) BioServer::Instance()->MemFree(mr.address);
+    }
+}
+
+TEST_F(TestBioServer, test_bio_server_writer_rejects_oversized_source)
+{
+    MirrorServerPtr mirror = BioServer::Instance()->GetMirrorServer();
+    constexpr uint32_t actualLength = 48;
+    constexpr uint32_t mrCapacity = 4 * 1024 * 1024;
+    std::vector<char> data(actualLength);
+    std::vector<FlowAddr> fromAddrs{FlowAddr(reinterpret_cast<uintptr_t>(data.data()), 0, actualLength)};
+    WCacheSlicePtr from = MakeRef<WCacheSlice>(1, 0, 0, actualLength, fromAddrs);
+    for (const auto &limits : {std::make_pair(actualLength - 1, mrCapacity),
+        std::make_pair(actualLength, actualLength - 1), std::make_pair(actualLength, 0U)}) {
+        MrInfo target{1, limits.second};
+        std::vector<FlowAddr> toAddrs{FlowAddr(target)};
+        RCacheSlicePtr to = MakeRef<RCacheSlice>(1, limits.first, toAddrs);
+        std::vector<NetMrInfo> remoteMrs;
+        std::vector<NetMrInfo> localMrs;
+        bool isAlloc = false;
+        EXPECT_EQ(mirror->WriterParseMrInfo(from.Get(), to.Get(), remoteMrs, localMrs, 1, isAlloc),
+            BIO_INVALID_PARAM);
+        EXPECT_FALSE(isAlloc);
+        EXPECT_TRUE(localMrs.empty());
+    }
 }
 
 TEST_F(TestBioServer, test_bio_server_writer_copy_slice_fail)

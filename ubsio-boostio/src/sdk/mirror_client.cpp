@@ -345,6 +345,15 @@ BResult MirrorClient::CreateDataMessageMemRemote()
         return BIO_ERR;
     }
 
+    const auto kvcConfig = GetBioKvcSnapshot();
+    if (kvcConfig && kvcConfig->values.remote &&
+        !KvcReadBudgetFitsPool(kvcConfig->values.readBlockLimit, dataMemSize, blockSize)) {
+        CLIENT_LOG_ERROR("KVC read block limit exceeds SDK pool capacity, limit:"
+            << kvcConfig->values.readBlockLimit << ", poolSize:" << dataMemSize << ", blockSize:" << blockSize);
+        close(realFd);
+        return BIO_INVALID_PARAM;
+    }
+
     auto address = mmap(nullptr, dataMemSize, PROT_READ | PROT_WRITE, MAP_SHARED, realFd, offset);
     if (address == MAP_FAILED) {
         CLIENT_LOG_ERROR("Mmap shm size " << dataMemSize << " offset " << offset << " failed, err:" << strerror(errno));

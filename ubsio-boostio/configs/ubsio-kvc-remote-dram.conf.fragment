@@ -3,7 +3,10 @@
 ubsio.kvc.mode = remote_dram_tcp
 ubsio.kvc.tenant_id = 71
 ubsio.kvc.remote_ips = 10.1.101.177,10.1.101.178,10.1.101.27,10.1.101.32
-ubsio.kvc.read_workers = 4
+ubsio.kvc.read_workers = 8
+# Shared per-process read budget in SDK blocks. With 4 MiB blocks this is 384 MiB.
+# Use a 512 MiB SDK pool to leave 32 blocks available for manifests and other operations.
+ubsio.kvc.read_block_limit = 96
 ubsio.kvc.manifest_one_get = false
 ubsio.net.data.protocol = tcp
 ubsio.work.net.timeout = 300

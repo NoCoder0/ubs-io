@@ -214,6 +214,12 @@ typedef struct {
  */
 CResult BioLoadKvcConfig(const char *path, uint32_t size, BioKvcConfigV1 *out, ClientOptionsConfig *tlsOptions);
 
+/** Return the per-process remote-read block budget from the prepared snapshot.
+ * Call BioLoadKvcConfig first. This does not read files or start networking.
+ * Each slot represents one SDK data-message block; pool capacity is checked at initialization.
+ */
+CResult BioGetKvcReadBlockLimit(uint32_t *out);
+
 /**
  * @brief: Initialize boostio service
  *

@@ -648,6 +648,15 @@ BResult MirrorServer::WriterParseMrInfo(const SlicePtr &from, const SlicePtr &to
         totalLen += mr.size;
     }
 
+    // The destination MR describes capacity; only the source data should be sent.
+    const uint64_t actualLen = from->GetLength();
+    if (UNLIKELY(actualLen > totalLen || actualLen > to->GetLength())) {
+        LOG_ERROR("Source length exceeds request or MR capacity, length:" << actualLen <<
+            ", requested:" << to->GetLength() << ", capacity:" << totalLen);
+        return BIO_INVALID_PARAM;
+    }
+    totalLen = actualLen;
+
     // 2. parse local mr info
     NetMrInfo bioMr;
     BResult ret = BioServer::Instance()->MemAlloc(totalLen, bioMr);

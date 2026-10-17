@@ -28,6 +28,7 @@ namespace ubsio {
 using BioExitFunc = void (*)(void);
 using BioInitFunc = CResult (*)(WorkerMode mode, ClientOptionsConfig *optConf);
 using BioLoadKvcConfigFunc = CResult (*)(const char *, uint32_t, BioKvcConfigV1 *, ClientOptionsConfig *);
+using BioGetKvcReadBlockLimitFunc = CResult (*)(uint32_t *);
 using BioCreateCacheFunc = CResult (*)(CacheDescriptor desc);
 using BioCalLocationFunc = CResult (*)(uint64_t tenantId, uint64_t objectId, ObjLocation *location);
 using BioGetFunc = CResult (*)(uint64_t tenantId, const char *key, uint64_t offset, uint64_t length, ObjLocation location,
@@ -114,6 +115,7 @@ public:
     static int32_t KvBioInit();
     static int32_t PrepareConfig(const char *path, uint32_t *mode);
     static uint32_t ReadWorkers();
+    static uint32_t ReadBlockLimit();
     static bool ManifestOneGet();
     static bool RemoteMode();
     static uint64_t TenantId();
@@ -143,6 +145,7 @@ private:
     static BioExitFunc pBioExit;
     static BioInitFunc pBioInitialize;
     static BioLoadKvcConfigFunc pBioLoadKvcConfig;
+    static BioGetKvcReadBlockLimitFunc pBioGetKvcReadBlockLimit;
     static BioGetFunc pBioGet;
     static BioPutFunc pBioPut;
     static BioStatFunc pBioStat;

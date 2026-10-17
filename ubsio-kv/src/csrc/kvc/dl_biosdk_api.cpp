@@ -21,6 +21,7 @@
 #include "ubsio_kvc_log.h"
 #include "ubsio_kvc_def.h"
 #include "dl_biosdk_api.h"
+#include "kv_operation.h"
 
 namespace ock {
 namespace ubsio {
@@ -30,17 +31,17 @@ std::mutex DlBioSdkApi::gMutex;
 void *DlBioSdkApi::bioSdkHandle = nullptr;
 const std::string DlBioSdkApi::gBioSdkLibName = "libbio_sdk.so";
 namespace {
-constexpr uint32_t DEFAULT_READ_WORKERS = 2;
-constexpr uint32_t D_READ_WORKERS = 4;
 constexpr uint64_t STANDALONE_TENANT_ID = 1;
 bool gPrepared = false;
-BioKvcConfigV1 gConfig{BIO_KVC_CONFIG_VERSION_1, BIO_KVC_MODE_STANDALONE, STANDALONE_TENANT_ID, DEFAULT_READ_WORKERS, 0};
+BioKvcConfigV1 gConfig{};
+uint32_t gReadBlockLimit = 0;
 ClientOptionsConfig gTlsOptions{};
 }
 
 BioExitFunc DlBioSdkApi::pBioExit = nullptr;
 BioInitFunc DlBioSdkApi::pBioInitialize = nullptr;
 BioLoadKvcConfigFunc DlBioSdkApi::pBioLoadKvcConfig = nullptr;
+BioGetKvcReadBlockLimitFunc DlBioSdkApi::pBioGetKvcReadBlockLimit = nullptr;
 BioCreateCacheFunc DlBioSdkApi::pBioCreateCache = nullptr;
 BioCalLocationFunc DlBioSdkApi::pBioCalcLocation = nullptr;
 BioGetFunc DlBioSdkApi::pBioGet = nullptr;
@@ -87,6 +88,7 @@ int32_t DlBioSdkApi::LoadLibrary()
         "BioShowLocalCacheResource");
 
     DL_LOAD_SYM(pBioLoadKvcConfig, BioLoadKvcConfigFunc, bioSdkHandle, "BioLoadKvcConfig");
+    DL_LOAD_SYM(pBioGetKvcReadBlockLimit, BioGetKvcReadBlockLimitFunc, bioSdkHandle, "BioGetKvcReadBlockLimit");
 
     gLoaded = true;
     return 0;
@@ -102,7 +104,9 @@ void DlBioSdkApi::CleanupLibrary()
     pBioExit = nullptr;
     pBioInitialize = nullptr;
     pBioLoadKvcConfig = nullptr;
+    pBioGetKvcReadBlockLimit = nullptr;
     gPrepared = false;
+    gReadBlockLimit = 0;
     pBioGet = nullptr;
     pBioPut = nullptr;
     pBioStat = nullptr;
@@ -131,10 +135,12 @@ int32_t DlBioSdkApi::PrepareConfig(const char *path, uint32_t *mode)
     BioKvcConfigV1 config{};
     config.version = BIO_KVC_CONFIG_VERSION_1;
     ClientOptionsConfig options{};
+    uint32_t readBlockLimit = 0;
     if (pBioLoadKvcConfig(path, sizeof(config), &config, &options) != RET_CACHE_OK ||
+        pBioGetKvcReadBlockLimit(&readBlockLimit) != RET_CACHE_OK || readBlockLimit == 0 ||
         config.version != BIO_KVC_CONFIG_VERSION_1 ||
         (config.mode != BIO_KVC_MODE_STANDALONE && config.mode != BIO_KVC_MODE_REMOTE_DRAM_TCP) ||
-        (config.readWorkers != DEFAULT_READ_WORKERS && config.readWorkers != D_READ_WORKERS) ||
+        config.readWorkers == 0 || config.readWorkers > KV_THREAD_NUM ||
         config.manifestOneGet > 1 ||
         (config.mode == BIO_KVC_MODE_STANDALONE ? config.tenantId != STANDALONE_TENANT_ID :
             config.tenantId <= STANDALONE_TENANT_ID)) {
@@ -143,6 +149,7 @@ int32_t DlBioSdkApi::PrepareConfig(const char *path, uint32_t *mode)
     }
     if (!gPrepared) {
         gConfig = config;
+        gReadBlockLimit = readBlockLimit;
         gTlsOptions = options;
         gPrepared = true;
     }
@@ -198,6 +205,11 @@ uint64_t DlBioSdkApi::TenantId()
 uint32_t DlBioSdkApi::ReadWorkers()
 {
     return gConfig.readWorkers;
+}
+
+uint32_t DlBioSdkApi::ReadBlockLimit()
+{
+    return gReadBlockLimit;
 }
 
 bool DlBioSdkApi::ManifestOneGet()

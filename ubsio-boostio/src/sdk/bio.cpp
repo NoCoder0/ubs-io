@@ -710,6 +710,15 @@ CResult BioLoadKvcConfig(const char *path, uint32_t size, BioKvcConfigV1 *out, C
     }
 }
 
+CResult BioGetKvcReadBlockLimit(uint32_t *out)
+{
+    if (out == nullptr) return RET_CACHE_EPERM;
+    const auto snapshot = GetBioKvcSnapshot();
+    if (!snapshot) return RET_CACHE_NOT_READY;
+    *out = snapshot->values.readBlockLimit;
+    return RET_CACHE_OK;
+}
+
 CResult BioInitialize(WorkerMode mode, ClientOptionsConfig *optConf)
 {
     const auto kvcConfig = GetBioKvcSnapshot();
