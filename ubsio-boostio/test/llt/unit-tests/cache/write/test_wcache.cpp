@@ -57,6 +57,76 @@ static uint64_t g_flowId = 0;
 static FlowInstance *g_flowInst = nullptr;
 
 namespace {
+// Isolate the real journal methods from the live cache/evict executors.
+template<typename Tag, typename Tag::Type member>
+struct JournalAccessor {
+    friend typename Tag::Type Member(Tag) { return member; }
+};
+struct JournalRing {
+    using Type = std::vector<EvictLogRecord> WCacheManager::*;
+    friend Type Member(JournalRing);
+};
+struct JournalEpoch {
+    using Type = uint64_t WCacheManager::*;
+    friend Type Member(JournalEpoch);
+};
+struct JournalDisk {
+    using Type = bool WCacheManager::*;
+    friend Type Member(JournalDisk);
+};
+struct JournalAppend {
+    using Type = void (WCacheManager::*)(const Key &);
+    friend Type Member(JournalAppend);
+};
+template struct JournalAccessor<JournalRing, &WCacheManager::mEvictLog>;
+template struct JournalAccessor<JournalEpoch, &WCacheManager::mEvictLogEpoch>;
+template struct JournalAccessor<JournalDisk, &WCacheManager::mHasDiskCache>;
+template struct JournalAccessor<JournalAppend, &WCacheManager::AppendEvictLog>;
+
+TEST(EvictJournalTest, IndependentCursorsWrapGapAndRestart)
+{
+    constexpr size_t capacity = 3;
+    constexpr uint64_t epoch = 73;
+    WCacheManager manager;
+    manager.*Member(JournalDisk{}) = false;
+    manager.*Member(JournalEpoch{}) = epoch;
+    (manager.*Member(JournalRing{})).resize(capacity);
+    auto append = [&](const char *value) {
+        Key key = const_cast<char *>(value);
+        (manager.*Member(JournalAppend{}))(key);
+    };
+    EvictLogResponse first{};
+    ASSERT_EQ(manager.ReadEvictLog({0, 0, 0, 0}, first), BIO_OK);
+    EXPECT_EQ(first.epoch, epoch);
+    EXPECT_EQ(first.nextSeq, 1U);
+    append("one");
+    append("two");
+    ASSERT_EQ(manager.ReadEvictLog({epoch, 0, 1, 0}, first), BIO_OK);
+    ASSERT_EQ(first.count, 1U);
+    EXPECT_STREQ(first.records[0].key, "one");
+    EvictLogResponse second{};
+    ASSERT_EQ(manager.ReadEvictLog({epoch, 0, 2, 0}, second), BIO_OK);
+    EXPECT_EQ(second.count, 2U); // Reading does not consume another reader's records.
+    append("three");
+    append("four");
+    ASSERT_EQ(manager.ReadEvictLog({epoch, 0, 2, 0}, first), BIO_OK);
+    EXPECT_EQ(first.status, EVICT_LOG_GAP);
+    EXPECT_EQ(first.count, 0U);
+    EXPECT_EQ(first.firstSeq, 2U);
+    ASSERT_EQ(manager.ReadEvictLog({epoch, 1, 3, 0}, second), BIO_OK);
+    ASSERT_EQ(second.count, 3U);
+    EXPECT_STREQ(second.records[0].key, "two");
+    EXPECT_STREQ(second.records[2].key, "four");
+    ASSERT_EQ(manager.ReadEvictLog({epoch + 1, 4, 1, 0}, first), BIO_OK);
+    EXPECT_EQ(first.status, EVICT_LOG_EPOCH_CHANGED);
+    ASSERT_EQ(manager.ReadEvictLog({epoch, second.nextSeq, 1, 0}, first), BIO_OK);
+    EXPECT_EQ(first.status, EVICT_LOG_GAP); // A future cursor must not silently succeed.
+    EXPECT_EQ(manager.ReadEvictLog({epoch, 0, EVICT_LOG_BATCH_MAX + 1, 0}, first), BIO_INVALID_PARAM);
+    EXPECT_EQ(manager.ReadEvictLog({epoch, 0, 0, 1}, first), BIO_INVALID_PARAM);
+    manager.*Member(JournalDisk{}) = true;
+    EXPECT_EQ(manager.ReadEvictLog({0, 0, 0, 0}, first), BIO_NOT_READY);
+}
+
 class DaemonConfigGuard {
 public:
     DaemonConfigGuard()

@@ -23,6 +23,8 @@
 #include "bio_client.h"
 #include "bio.h"
 #include "bio_kvc_config.h"
+#include "bio_client_net.h"
+#include "message_op.h"
 
 namespace ock {
 namespace bio {
@@ -750,9 +752,98 @@ CResult BioRegisterMetaEventCallback(UbsioMetaEventCallbackC callback, void *con
     return agentPtr->RegisterMetaEventCallback(callback, context) == BIO_OK ? RET_CACHE_OK : RET_CACHE_ERROR;
 }
 
+namespace {
+struct EvictCursor {
+    uint64_t epoch{0};
+    uint64_t afterSeq{0};
+    bool gap{false};
+};
+std::mutex gEvictPollMutex;
+std::map<uint16_t, EvictCursor> gEvictCursors;
+bool gEvictBootstrapped = false;
+
+CResult PollEvictNode(uint16_t nodeId, UbsioMetaEventCallbackC callback, void *context, uint32_t limit)
+{
+    auto found = gEvictCursors.find(nodeId);
+    if (found == gEvictCursors.end() && gEvictBootstrapped) {
+        // A node appearing after writes may already have evicted data. Never silently tail it.
+        CLIENT_LOG_ERROR("Eviction journal requires reconciliation for new node:" << nodeId);
+        gEvictCursors[nodeId].gap = true;
+    }
+    auto &cursor = gEvictCursors[nodeId];
+    if (cursor.gap) return RET_CACHE_UNAVAILABLE;
+    if (limit == 0 && cursor.epoch != 0) return RET_CACHE_OK;
+    EvictLogRequest request{cursor.epoch, cursor.afterSeq, limit, 0};
+    EvictLogResponse response{};
+    const auto ret = net::BioClientNet::Instance()->SendSync<EvictLogRequest, EvictLogResponse>(
+        nodeId, BIO_OP_SDK_READ_EVICT_LOG, request, response);
+    if (ret != BIO_OK) return RET_CACHE_NEED_RETRY;
+    if (response.epoch == 0 || response.firstSeq == 0 || response.nextSeq < response.firstSeq ||
+        response.count > limit || response.count > EVICT_LOG_BATCH_MAX || response.status > EVICT_LOG_EPOCH_CHANGED) {
+        return RET_CACHE_ERROR;
+    }
+    if (response.status != EVICT_LOG_OK || (limit != 0 && (response.epoch != cursor.epoch ||
+        cursor.afterSeq < response.firstSeq - 1 || cursor.afterSeq >= response.nextSeq))) {
+        cursor.gap = true;
+        CLIENT_LOG_ERROR("Eviction journal GAP/epoch change, node:" << nodeId << ", after:" << cursor.afterSeq
+            << ", first:" << response.firstSeq << ", next:" << response.nextSeq);
+        return RET_CACHE_UNAVAILABLE;
+    }
+    if (limit == 0) {
+        cursor.epoch = response.epoch;
+        cursor.afterSeq = response.nextSeq - 1;
+        return RET_CACHE_OK;
+    }
+    std::vector<UbsioMetaEventC> events;
+    for (uint32_t i = 0; i < response.count; ++i) {
+        const auto &record = response.records[i];
+        const auto length = strnlen(record.key, KEY_MAX_SIZE);
+        if (length == 0 || length == KEY_MAX_SIZE || record.seq != cursor.afterSeq + i + 1 ||
+            record.seq >= response.nextSeq) return RET_CACHE_ERROR;
+        events.push_back({UBSIO_META_DELETE_C, record.key, static_cast<uint32_t>(length)});
+    }
+    // Complete synchronous delivery before advancing. Exceptions leave this batch replayable.
+    if (!events.empty()) callback(context, events.data(), static_cast<uint32_t>(events.size()));
+    cursor.afterSeq += response.count;
+    return RET_CACHE_OK;
+}
+}
+
+CResult BioPollEvictEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit)
+{
+    if (limit > EVICT_LOG_BATCH_MAX || (limit != 0 && callback == nullptr)) return RET_CACHE_EPERM;
+    std::lock_guard<std::mutex> lock(gEvictPollMutex);
+    try {
+        const auto config = GetBioKvcSnapshot();
+        if (!gClient->Ready() || !config || !config->values.remote ||
+            (limit != 0 && !gEvictBootstrapped)) return RET_CACHE_NOT_READY;
+        const auto nodes = gClient->GetMirror()->GetNodeView();
+        CResult result = RET_CACHE_OK;
+        size_t found = 0;
+        for (const auto &node : nodes) {
+            if (config->values.remoteIps.count(node.second.ip) == 0) continue;
+            ++found;
+            if (node.second.status != CM_NODE_NORMAL) {
+                if (result == RET_CACHE_OK) result = RET_CACHE_NEED_RETRY;
+                continue;
+            }
+            auto ret = PollEvictNode(node.first.VNodeId(), callback, context, limit);
+            if (ret == RET_CACHE_UNAVAILABLE || (ret != RET_CACHE_OK && result == RET_CACHE_OK)) result = ret;
+        }
+        if (found != config->values.remoteIps.size() && result == RET_CACHE_OK) result = RET_CACHE_NEED_RETRY;
+        if (limit == 0 && result == RET_CACHE_OK) gEvictBootstrapped = true;
+        return result;
+    } catch (...) {
+        return RET_CACHE_ERROR;
+    }
+}
+
 void BioExit(void)
 {
+    std::lock_guard<std::mutex> lock(gEvictPollMutex);
     BioService::Exit();
+    gEvictCursors.clear();
+    gEvictBootstrapped = false;
 }
 
 static void BioCacheResourceCalc(CacheResourcesDesc **nodeDesc, const std::vector<CacheResourcesDesc> &nodeDescription)

@@ -4,6 +4,7 @@
  */
 #include "remote_dram_object.h"
 #include "remote_read_limits.h"
+#include "ubsio_kvc.h"
 
 #include <array>
 #include <algorithm>
@@ -15,6 +16,8 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
+#include <cctype>
 #include <unistd.h>
 #if defined(__aarch64__) && defined(__linux__)
 #include <arm_acle.h>
@@ -519,6 +522,78 @@ int32_t Exist(const std::string &key)
     return Length(key, length);
 }
 
+namespace {
+struct EvictDelivery {
+    UbsioMetaEventCallbackC callback;
+    void *context;
+    std::set<std::pair<std::string, uint64_t>> delivered;
+};
+
+bool ParseEvictedKey(const UbsioMetaEventC &event, uint64_t &hash, uint64_t &generation, uint32_t &index)
+{
+    constexpr size_t physicalKeyLength = 55;
+    constexpr size_t prefixLength = 13;
+    constexpr size_t generationSeparator = 29;
+    constexpr size_t indexSeparator = 46;
+    if (event.type != UBSIO_META_DELETE_C || event.key == nullptr || event.keyLen != physicalKeyLength ||
+        std::memcmp(event.key, "__kvc_tcp_v1_", prefixLength) != 0 ||
+        event.key[generationSeparator] != '_' || event.key[indexSeparator] != '_') return false;
+    for (size_t i = prefixLength; i < physicalKeyLength; ++i) {
+        if (i != generationSeparator && i != indexSeparator &&
+            !std::isxdigit(static_cast<unsigned char>(event.key[i]))) return false;
+    }
+    // Input is borrowed and need not be NUL-terminated.
+    const std::string key(event.key, event.keyLen);
+    unsigned long long parsedHash = 0;
+    unsigned long long parsedGeneration = 0;
+    unsigned int parsedIndex = 0;
+    if (std::sscanf(key.c_str(), "__kvc_tcp_v1_%16llx_%16llx_%8x",
+                    &parsedHash, &parsedGeneration, &parsedIndex) != 3) return false;
+    hash = parsedHash;
+    generation = parsedGeneration;
+    index = parsedIndex;
+    return true;
+}
+
+void DeliverEvictions(void *context, const UbsioMetaEventC *events, uint32_t count)
+{
+    auto &delivery = *static_cast<EvictDelivery *>(context);
+    std::vector<std::string> keys;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t hash = 0;
+        uint64_t generation = 0;
+        uint32_t index = 0;
+        if (!ParseEvictedKey(events[i], hash, generation, index)) continue;
+        const size_t shard = hash % KEY_LOCK_COUNT;
+        std::lock_guard<std::mutex> lock(keyLocks[shard]);
+        for (const auto &entry : committed[shard]) {
+            const auto &manifest = entry.second;
+            if (manifest.keyHash != hash || manifest.generation != generation ||
+                (index != UINT32_MAX && index >= manifest.chunkCount)) continue;
+            if (delivery.delivered.emplace(entry.first, generation).second) keys.push_back(entry.first);
+        }
+    }
+    // Do not hold directory locks over callbacks/RPC. Keep the generation directory so
+    // normal Get/Delete/Put semantics are unchanged; this is an invalidation hint, not a payload delete.
+    std::vector<UbsioMetaEventC> logicalEvents;
+    for (const auto &key : keys) {
+        logicalEvents.push_back({UBSIO_META_DELETE_C, key.c_str(), static_cast<uint32_t>(key.size())});
+    }
+    if (!logicalEvents.empty()) {
+        delivery.callback(delivery.context, logicalEvents.data(), static_cast<uint32_t>(logicalEvents.size()));
+    }
+}
+}
+
+int32_t PollMetaEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit)
+{
+    constexpr uint32_t maxBatch = 64;
+    if (limit > maxBatch || (limit != 0 && callback == nullptr)) return UBSIO_KVC_INVALID_PARAM;
+    if (!DlBioSdkApi::RemoteMode()) return UBSIO_KVC_INVALID_PARAM;
+    EvictDelivery delivery{callback, context, {}};
+    return MapBio(DlBioSdkApi::PollEvictEvents(DeliverEvictions, &delivery, limit));
+}
+
 void ResetDirectory()
 {
     for (size_t index = 0; index < KEY_LOCK_COUNT; ++index) {
@@ -530,3 +605,13 @@ void ResetDirectory()
 } // namespace remote_dram
 } // namespace ubsio
 } // namespace ock
+
+extern "C" __attribute__((visibility("default")))
+int32_t UbsioKvCachePollMetaEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit)
+{
+    try {
+        return ock::ubsio::remote_dram::PollMetaEvents(callback, context, limit);
+    } catch (...) {
+        return ock::ubsio::UBSIO_KVC_ERR;
+    }
+}

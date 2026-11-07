@@ -15,6 +15,8 @@
 #include <iterator>
 #include <unordered_set>
 #include <utility>
+#include <random>
+#include <cstring>
 #include "bio_log.h"
 #include "bio_trace.h"
 #include "bio_tracepoint_helper.h"
@@ -53,6 +55,19 @@ BResult WCacheManager::Init(const RCacheManagerPtr &rCacheManager)
     auto daemonConfig = BioConfig::Instance()->GetDaemonConfig();
     mEnableCrc = daemonConfig.enableCrc;
     mHasDiskCache = daemonConfig.hasDiskCache;
+    // Only the disposable memory-only tier participates; SSD/UFS notifications stay unchanged.
+    if (!mHasDiskCache) {
+        std::lock_guard<std::mutex> lock(mEvictLogLock);
+        try {
+            std::random_device random;
+            mEvictLogEpoch = (static_cast<uint64_t>(random()) << 32) | random();
+            if (mEvictLogEpoch == 0) return BIO_INNER_ERR;
+            mEvictLog.resize(EVICT_LOG_CAPACITY);
+            mEvictLogNextSeq = 1;
+        } catch (...) {
+            return BIO_ALLOC_FAIL;
+        }
+    }
     mCacheIndex = MakeRef<WCacheIndex>();
     ChkTrue(mCacheIndex != nullptr, BIO_ALLOC_FAIL, "Make write cache index instance failed.");
 
@@ -218,6 +233,7 @@ BResult WCacheManager::CreateWCache(uint64_t procId, uint64_t flowId, uint16_t p
     WCache::EvictCallback evictCallback = [this](uint16_t ptId, const Key &key, WCacheSliceRefPtr sliceRef,
         const UbsIoMetaEventBatchPtr &batch) -> BResult {
         mCacheIndex->Delete(ptId, key, sliceRef);
+        AppendEvictLog(key);
         AppendMetaEvent(UBSIO_META_DELETE, key, batch);
         return BIO_OK;
     };
@@ -694,6 +710,43 @@ void WCacheManager::RegUbsIoMetaEventCallback(UbsIoMetaEventCallback callback)
 {
     LOG_INFO("Register UBS IO meta event callback");
     mMetaEventCallback = std::move(callback);
+}
+
+void WCacheManager::AppendEvictLog(const Key &key)
+{
+    if (mHasDiskCache || key == nullptr) return;
+    const size_t length = strnlen(key, KEY_MAX_SIZE);
+    if (length == 0 || length == KEY_MAX_SIZE) return;
+    std::lock_guard<std::mutex> lock(mEvictLogLock);
+    if (mEvictLog.empty()) return;
+    auto &record = mEvictLog[(mEvictLogNextSeq - 1) % mEvictLog.size()];
+    record = {};
+    record.seq = mEvictLogNextSeq++;
+    std::memcpy(record.key, key, length);
+    record.key[length] = '\0';
+}
+
+BResult WCacheManager::ReadEvictLog(const EvictLogRequest &request, EvictLogResponse &response)
+{
+    if (request.limit > EVICT_LOG_BATCH_MAX || request.reserved != 0) return BIO_INVALID_PARAM;
+    std::lock_guard<std::mutex> lock(mEvictLogLock);
+    if (mHasDiskCache || mEvictLog.empty()) return BIO_NOT_READY;
+    response = {};
+    response.epoch = mEvictLogEpoch;
+    response.nextSeq = mEvictLogNextSeq;
+    response.firstSeq = mEvictLogNextSeq > mEvictLog.size() ? mEvictLogNextSeq - mEvictLog.size() : 1;
+    if (request.limit == 0) return BIO_OK;
+    if (request.epoch != response.epoch) {
+        response.status = EVICT_LOG_EPOCH_CHANGED;
+    } else if (request.afterSeq < response.firstSeq - 1 || request.afterSeq >= response.nextSeq) {
+        response.status = EVICT_LOG_GAP;
+    } else {
+        for (uint64_t seq = request.afterSeq + 1;
+             seq < response.nextSeq && response.count < request.limit; ++seq) {
+            response.records[response.count++] = mEvictLog[(seq - 1) % mEvictLog.size()];
+        }
+    }
+    return BIO_OK;
 }
 
 void WCacheManager::AppendMetaEvent(UbsIoMetaEventType type, const Key &key,

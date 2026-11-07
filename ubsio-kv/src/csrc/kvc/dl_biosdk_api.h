@@ -43,6 +43,7 @@ using BioDeleteFunc = CResult (*)(uint64_t tenantId, const char *key, ObjLocatio
 using BioBatchGetKeyDiskAddrFunc = CResult (*)(uint64_t tenantId, const char **keys, ObjLocation *locations,
                                                 const uint32_t count, KeyAddrInfo *infos);
 using BioRegisterMetaEventCallbackFunc = CResult (*)(UbsioMetaEventCallbackC callback, void *context);
+using BioPollEvictEventsFunc = CResult (*)(UbsioMetaEventCallbackC, void *, uint32_t);
 using BioShowLocalCacheResourceFunc = CResult (*)(CacheResourcesDesc *nodeDesc);
 
 class DlBioSdkApi {
@@ -131,6 +132,11 @@ public:
         return static_cast<CResult>(pBioRegisterMetaEventCallback(callback, context));
     }
 
+    static CResult PollEvictEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit)
+    {
+        return pBioPollEvictEvents == nullptr ? RET_CACHE_NOT_READY : pBioPollEvictEvents(callback, context, limit);
+    }
+
     static CResult ShowLocalCacheResource(CacheResourcesDesc *nodeDesc)
     {
         return static_cast<CResult>(pBioShowLocalCacheResource(nodeDesc));
@@ -157,6 +163,7 @@ private:
     static BioDeleteFunc pBioDelete;
     static BioBatchGetKeyDiskAddrFunc pBioBatchGetKeyDiskAddr;
     static BioRegisterMetaEventCallbackFunc pBioRegisterMetaEventCallback;
+    static BioPollEvictEventsFunc pBioPollEvictEvents;
     static BioShowLocalCacheResourceFunc pBioShowLocalCacheResource;
 };
 

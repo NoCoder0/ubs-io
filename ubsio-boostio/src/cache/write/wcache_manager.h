@@ -111,6 +111,8 @@ public:
 
     void RegUbsIoMetaEventCallback(UbsIoMetaEventCallback callback);
 
+    BResult ReadEvictLog(const EvictLogRequest &request, EvictLogResponse &response);
+
     void AppendMetaEvent(UbsIoMetaEventType type, const Key &key,
         const UbsIoMetaEventBatchPtr &batch = nullptr);
 
@@ -166,6 +168,7 @@ private:
     void RetryEvictThread();
     void DestroyEvictThread();
     void ScheduleFlushMetaEvents();
+    void AppendEvictLog(const Key &key);
     void FlushMetaEvents();
 
 private:
@@ -189,6 +192,10 @@ private:
 
     std::mutex mMetaReportLock;
     std::vector<UbsIoMetaEvent> mPendingMetaEvents;
+    std::mutex mEvictLogLock;
+    std::vector<EvictLogRecord> mEvictLog;
+    uint64_t mEvictLogEpoch{0};
+    uint64_t mEvictLogNextSeq{1};
     std::atomic<bool> mMetaReportScheduled{ false };
     UbsIoMetaEventCallback mMetaEventCallback{ nullptr };
 

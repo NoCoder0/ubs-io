@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include "ubsio_kvc.h"
 
 enum CResult {
     RET_CACHE_OK,
@@ -42,12 +43,25 @@ extern uint32_t mockBatchGetCalls;
 extern uint32_t mockBatchGetFreeCalls;
 extern bool mockBatchGetShortRead;
 extern bool mockBatchGetGlobalFailure;
+inline std::vector<std::string> mockEvictKeys;
+inline CResult mockEvictResult = RET_CACHE_OK;
+inline bool mockRemoteMode = true;
 
 namespace ock {
 namespace ubsio {
 class DlBioSdkApi {
 public:
     static uint64_t TenantId() { return 17; }
+    static bool RemoteMode() { return mockRemoteMode; }
+    static CResult PollEvictEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit)
+    {
+        std::vector<UbsioMetaEventC> events;
+        for (const auto &key : mockEvictKeys) {
+            events.push_back({UBSIO_META_DELETE_C, key.data(), static_cast<uint32_t>(key.size())});
+        }
+        if (limit != 0 && !events.empty()) callback(context, events.data(), static_cast<uint32_t>(events.size()));
+        return mockEvictResult;
+    }
     static uint32_t ReadBlockLimit() { return 64; }
     static bool ManifestOneGet() { return mockManifestOneGet; }
     static bool mockManifestOneGet;

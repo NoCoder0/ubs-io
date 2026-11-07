@@ -53,6 +53,7 @@ BioBatchFreeFunc DlBioSdkApi::pBioBatchGetFree = nullptr;
 BioDeleteFunc DlBioSdkApi::pBioDelete = nullptr;
 BioBatchGetKeyDiskAddrFunc DlBioSdkApi::pBioBatchGetKeyDiskAddr = nullptr;
 BioRegisterMetaEventCallbackFunc DlBioSdkApi::pBioRegisterMetaEventCallback = nullptr;
+BioPollEvictEventsFunc DlBioSdkApi::pBioPollEvictEvents = nullptr;
 BioShowLocalCacheResourceFunc DlBioSdkApi::pBioShowLocalCacheResource = nullptr;
 
 int32_t DlBioSdkApi::LoadLibrary()
@@ -84,6 +85,8 @@ int32_t DlBioSdkApi::LoadLibrary()
     DL_LOAD_SYM(pBioBatchGetKeyDiskAddr, BioBatchGetKeyDiskAddrFunc, bioSdkHandle, "BioBatchGetKeyDiskAddr");
     DL_LOAD_SYM(pBioRegisterMetaEventCallback, BioRegisterMetaEventCallbackFunc, bioSdkHandle,
         "BioRegisterMetaEventCallback");
+    // Optional for standalone compatibility. Remote polling initialization requires this symbol.
+    pBioPollEvictEvents = reinterpret_cast<BioPollEvictEventsFunc>(dlsym(bioSdkHandle, "BioPollEvictEvents"));
     DL_LOAD_SYM(pBioShowLocalCacheResource, BioShowLocalCacheResourceFunc, bioSdkHandle,
         "BioShowLocalCacheResource");
 
@@ -118,6 +121,7 @@ void DlBioSdkApi::CleanupLibrary()
     pBioDelete = nullptr;
     pBioBatchGetKeyDiskAddr = nullptr;
     pBioRegisterMetaEventCallback = nullptr;
+    pBioPollEvictEvents = nullptr;
     pBioShowLocalCacheResource = nullptr;
 
     if (bioSdkHandle != nullptr) {

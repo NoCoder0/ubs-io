@@ -151,6 +151,22 @@ void MirrorServer::RegisterOpcode()
         std::bind(&MirrorServer::HandleAddDisk, this, std::placeholders::_1));
 
     RegisterOpcodeStep2(netEngine);
+    netEngine->RegisterNewRequestHandler(BIO_OP_SDK_READ_EVICT_LOG, [this](ServiceContext &ctx) -> int32_t {
+        auto net = BioServer::Instance()->GetNetEngine();
+        if (!Ready()) {
+            net->Reply(ctx, BIO_NOT_READY, nullptr, 0);
+            return BIO_OK;
+        }
+        if (ctx.MessageData() == nullptr || ctx.MessageDataLen() != sizeof(EvictLogRequest)) {
+            net->Reply(ctx, BIO_INVALID_PARAM, nullptr, 0);
+            return BIO_OK;
+        }
+        EvictLogResponse response{};
+        auto request = static_cast<const EvictLogRequest *>(ctx.MessageData());
+        auto ret = WCacheManager::Instance()->ReadEvictLog(*request, response);
+        net->Reply(ctx, ret, ret == BIO_OK ? &response : nullptr, ret == BIO_OK ? sizeof(response) : 0);
+        return BIO_OK;
+    });
 }
 
 void MirrorServer::ReplyListResultLocal(ServiceContext &ctx, std::unordered_map<std::string, ObjStat> &objs,

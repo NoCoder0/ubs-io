@@ -237,6 +237,14 @@ CResult BioInitialize(WorkerMode mode, ClientOptionsConfig *optConf);
  */
 CResult BioRegisterMetaEventCallback(UbsioMetaEventCallbackC callback, void *context);
 
+// Remote DRAM only. limit=0 bootstraps once, before writes; it never resets a live cursor.
+// Positive limit (<=64) reads one batch per configured node. Callback receives physical keys
+// synchronously, must copy borrowed pointers and must not re-enter this API or BioExit.
+// One consumer per SDK process. UNAVAILABLE is sticky after a journal gap/restart;
+// a failed node keeps its cursor, but successful batches on other nodes may advance.
+// There is no live reset: reconcile externally before Exit/reinitialization.
+CResult BioPollEvictEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit);
+
 /**
  * @brief: Exit boostio service
  *

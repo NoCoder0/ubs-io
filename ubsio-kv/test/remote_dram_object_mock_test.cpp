@@ -254,5 +254,52 @@ int main()
     assert(remote_dram::Exist("restart") == UBSIO_KVC_NOT_FOUND);
     assert(remote_dram::Put("restart", replacement.data(), replacement.size()) == UBSIO_KVC_OK);
     assert(remote_dram::Get("restart", output.data(), output.size()) == UBSIO_KVC_OK && output == replacement);
-    std::cout << "remote_dram_object: integrity, late write/delete, rebuild and restart PASS\n";
+    // Exercise the real polling adapter with physical chunk/manifest events.
+    remote_dram::ResetDirectory();
+    objects.clear();
+    assert(remote_dram::Put("evicted", data.data(), data.size()) == UBSIO_KVC_OK);
+    std::vector<std::string> notified;
+    auto collect = [](void *context, const UbsioMetaEventC *events, uint32_t count) {
+        auto &keys = *static_cast<std::vector<std::string> *>(context);
+        for (uint32_t i = 0; i < count; ++i) {
+            assert(events[i].type == UBSIO_META_DELETE_C);
+            keys.emplace_back(events[i].key, events[i].keyLen);
+            // A reentrant directory operation proves callbacks execute outside its shard lock.
+            uint32_t length = 0;
+            assert(remote_dram::Length(keys.back(), length) == UBSIO_KVC_OK);
+        }
+    };
+    for (const auto &entry : objects) mockEvictKeys.push_back(entry.first);
+    const auto oldEvents = mockEvictKeys;
+    mockEvictKeys.insert(mockEvictKeys.end(), oldEvents.begin(), oldEvents.end());
+    assert(UbsioKvCachePollMetaEvents(nullptr, nullptr, 0) == UBSIO_KVC_OK);
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 64) == UBSIO_KVC_OK);
+    assert(notified == std::vector<std::string>{"evicted"}); // chunks + manifest + duplicates => one key
+
+    notified.clear();
+    assert(remote_dram::Put("evicted", replacement.data(), replacement.size()) == UBSIO_KVC_OK);
+    mockEvictKeys = oldEvents;
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 64) == UBSIO_KVC_OK);
+    assert(notified.empty()); // old generation cannot identify the replacement
+    mockEvictKeys.clear();
+    const auto current = objects.begin()->first;
+    mockEvictKeys = {"plain-key", current.substr(0, current.size() - 1), current + "junk",
+                    current.substr(0, 47) + "fffffffe"}; // invalid chunk index
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 64) == UBSIO_KVC_OK);
+    assert(notified.empty());
+    mockEvictKeys.push_back(current);
+    mockEvictResult = RET_CACHE_UNAVAILABLE; // a healthy node's batch can accompany another node's GAP
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 64) == UBSIO_KVC_UNAVAILABLE);
+    assert(notified == std::vector<std::string>{"evicted"});
+    mockEvictKeys.clear();
+    notified.clear();
+    mockEvictResult = RET_CACHE_NEED_RETRY;
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 64) == UBSIO_KVC_UNAVAILABLE);
+    assert(notified.empty());
+    assert(UbsioKvCachePollMetaEvents(nullptr, nullptr, 1) == UBSIO_KVC_INVALID_PARAM);
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 65) == UBSIO_KVC_INVALID_PARAM);
+    mockRemoteMode = false;
+    assert(UbsioKvCachePollMetaEvents(collect, &notified, 64) == UBSIO_KVC_INVALID_PARAM);
+    mockRemoteMode = true;
+    std::cout << "remote_dram_object: integrity, generation filtering, eviction polling and restart PASS\n";
 }

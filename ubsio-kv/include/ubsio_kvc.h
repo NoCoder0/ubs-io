@@ -71,6 +71,16 @@ typedef struct {
 typedef void (*UbsioMetaEventCallbackC)(void *context, const UbsioMetaEventC *events, uint32_t count);
 #endif
 
+/** Remote DRAM only. limit=0 initializes journal cursors once, before accepting writes. Positive limit (<=64)
+ * polls one batch per remote node and synchronously delivers logical DELETE keys through callback.
+ * One consumer per SDK process; the caller serializes calls and drains them before Exit.
+ * Callback must not re-enter polling/Exit. Borrowed event/key pointers are valid
+ * only inside callback. A nonzero result may accompany successfully delivered batches from other
+ * nodes. Journal GAP/restart is sticky; reconcile externally before Exit/reinitialization.
+ * No automatic scan or MetaService acknowledgement is provided by this API.
+ */
+int32_t UbsioKvCachePollMetaEvents(UbsioMetaEventCallbackC callback, void *context, uint32_t limit);
+
 /**
  * @brief Initialize UBS-IO KV Cache
  *

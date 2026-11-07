@@ -48,6 +48,29 @@ typedef struct {
     pid_t pid;
 } RequestComm;
 
+// Node-local, volatile eviction journal. Zero limit reads the initial tail only.
+const uint32_t EVICT_LOG_BATCH_MAX = 64;
+const uint32_t EVICT_LOG_CAPACITY = 65536;
+enum EvictLogStatus : uint32_t { EVICT_LOG_OK = 0, EVICT_LOG_GAP = 1, EVICT_LOG_EPOCH_CHANGED = 2 };
+struct EvictLogRecord {
+    uint64_t seq;
+    char key[KEY_MAX_SIZE];
+};
+struct EvictLogRequest {
+    uint64_t epoch;
+    uint64_t afterSeq;
+    uint32_t limit;
+    uint32_t reserved;
+};
+struct EvictLogResponse {
+    uint64_t epoch;
+    uint64_t firstSeq;
+    uint64_t nextSeq;
+    uint32_t status;
+    uint32_t count;
+    EvictLogRecord records[EVICT_LOG_BATCH_MAX];
+};
+
 /* Shm init */
 typedef struct {
     RequestComm comm;
